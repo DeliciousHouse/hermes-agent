@@ -553,21 +553,38 @@ export function usePromptActions({
       const ensureSessionId = async (sessionHint?: string) =>
         sessionHint || activeSessionIdRef.current || (await createBackendSessionForSend())
 
-      // `exec` commands (and unknown skill / quick commands the backend owns)
-      // run on the gateway and render their text output inline. This is the only
-      // path that talks to slash.exec / command.dispatch.
-      async function runExec(ctx: SlashActionCtx): Promise<void> {
-        const { arg, command, name, recordInput, sessionHint } = ctx
-        const sessionId = await ensureSessionId(sessionHint)
+      // Resolve the target session plus a writer for inline slash output, or
+      // notify + return null when none can be created. Folds the ensure / bail /
+      // build-renderSlashOutput boilerplate every exec-style handler repeats.
+      const withSlashOutput = async (
+        ctx: SlashActionCtx
+      ): Promise<{ render: (text: string) => void; sessionId: string } | null> => {
+        const sessionId = await ensureSessionId(ctx.sessionHint)
 
         if (!sessionId) {
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
+          return null
+        }
+
+        const render = (text: string) =>
+          appendSessionTextMessage(sessionId, 'system', ctx.recordInput ? slashStatusText(ctx.command, text) : text)
+
+        return { render, sessionId }
+      }
+
+      // `exec` commands (and unknown skill / quick commands the backend owns)
+      // run on the gateway and render their text output inline. This is the only
+      // path that talks to slash.exec / command.dispatch.
+      async function runExec(ctx: SlashActionCtx): Promise<void> {
+        const { arg, command, name } = ctx
+        const resolved = await withSlashOutput(ctx)
+
+        if (!resolved) {
           return
         }
 
-        const renderSlashOutput = (text: string) =>
-          appendSessionTextMessage(sessionId, 'system', recordInput ? slashStatusText(command, text) : text)
+        const { render: renderSlashOutput, sessionId } = resolved
 
         if (!isDesktopSlashCommand(name)) {
           renderSlashOutput(desktopSlashUnavailableMessage(name) || `/${name} is not available in the desktop app.`)
@@ -758,17 +775,14 @@ export function usePromptActions({
             return
           }
 
-          const { arg, command, recordInput, sessionHint } = ctx
-          const sessionId = await ensureSessionId(sessionHint)
+          const resolved = await withSlashOutput(ctx)
 
-          if (!sessionId) {
-            notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
-
+          if (!resolved) {
             return
           }
 
-          const renderSlashOutput = (text: string) =>
-            appendSessionTextMessage(sessionId, 'system', recordInput ? slashStatusText(command, text) : text)
+          const { render: renderSlashOutput, sessionId } = resolved
+          const { arg } = ctx
 
           try {
             const result = await requestGateway<SessionTitleResponse>('session.title', {
@@ -790,17 +804,14 @@ export function usePromptActions({
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
-        help: async ({ command, recordInput, sessionHint }) => {
-          const sessionId = await ensureSessionId(sessionHint)
+        help: async ctx => {
+          const resolved = await withSlashOutput(ctx)
 
-          if (!sessionId) {
-            notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
-
+          if (!resolved) {
             return
           }
 
-          const renderSlashOutput = (text: string) =>
-            appendSessionTextMessage(sessionId, 'system', recordInput ? slashStatusText(command, text) : text)
+          const { render: renderSlashOutput, sessionId } = resolved
 
           try {
             const catalog = await requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
@@ -875,12 +886,8 @@ export function usePromptActions({
 
         switch (surface?.kind) {
           case 'unavailable': {
-            const sessionId = await ensureSessionId(sessionHint)
-
-            if (sessionId) {
-              const message = desktopSlashUnavailableMessage(name) || `/${name} is not available in the desktop app.`
-              appendSessionTextMessage(sessionId, 'system', recordInput ? slashStatusText(command, message) : message)
-            }
+            const resolved = await withSlashOutput(ctx)
+            resolved?.render(desktopSlashUnavailableMessage(name) || `/${name} is not available in the desktop app.`)
 
             return
           }
