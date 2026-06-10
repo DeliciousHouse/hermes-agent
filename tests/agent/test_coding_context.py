@@ -52,12 +52,32 @@ class TestIsCodingContext:
 # ── toolset substitution ────────────────────────────────────────────────────
 
 class TestCodingSelection:
-    def test_selects_coding_when_active(self, tmp_path):
+    def test_selects_coding_under_focus(self, tmp_path):
         _git_init(tmp_path)
-        cfg = {"agent": {"coding_context": "on"}}
+        cfg = {"agent": {"coding_context": "focus"}}
         out = cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg)
         assert out is not None
         assert out[0] == cc.CODING_TOOLSET
+
+    def test_auto_is_prompt_only(self, tmp_path):
+        # Default posture must never override the user's configured toolsets —
+        # off-by-default toolsets are already off, and explicit opt-ins
+        # (image-gen, spotify, …) survive entering a code workspace.
+        _git_init(tmp_path)
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg) is None
+        # …while the prompt posture is still active.
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_on_is_prompt_only(self, tmp_path):
+        cfg = {"agent": {"coding_context": "on"}}
+        assert cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg) is None
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_focus_requires_workspace(self, tmp_path):
+        # focus inherits auto's detection gate — bare dir stays general.
+        cfg = {"agent": {"coding_context": "focus"}}
+        assert cc.coding_selection(platform="cli", cwd=tmp_path, config=cfg) is None
 
     def test_none_when_inactive(self, tmp_path):
         cfg = {"agent": {"coding_context": "off"}}
@@ -151,10 +171,16 @@ class TestRuntimeMode:
         assert any("coding agent" in b for b in blocks)
         assert any("Workspace" in b for b in blocks)
 
-    def test_toolset_selection_starts_with_coding(self, tmp_path):
-        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "on"}})
-        sel = mode.toolset_selection()
+    def test_toolset_selection_gated_on_focus(self, tmp_path):
+        _git_init(tmp_path)
+        focus = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "focus"}})
+        sel = focus.toolset_selection()
         assert sel and sel[0] == cc.CODING_TOOLSET
+        # auto/on resolve the coding profile but stay prompt-only.
+        for raw in ("auto", "on"):
+            mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": raw}})
+            assert mode.is_coding is True
+            assert mode.toolset_selection() is None
 
 
 # ── profile registry ────────────────────────────────────────────────────────

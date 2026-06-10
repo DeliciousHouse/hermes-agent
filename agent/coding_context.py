@@ -13,11 +13,14 @@ is *data* — it declares the toolset to collapse to, the operating brief to
 inject, and hints for other domains (model routing, memory, subagents). Every
 domain reads the same resolved object instead of probing git/config itself:
 
-  * **Toolset** — ``RuntimeMode.toolset_selection()`` → the ``coding`` toolset
-    plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``). Messaging
-    / TTS / image-gen / smart-home / music / cron / computer-use fall away.
   * **System prompt** — ``RuntimeMode.system_blocks()`` → the operating brief +
     a live git/workspace snapshot (``agent/system_prompt.py``).
+  * **Toolset** — ``RuntimeMode.toolset_selection()`` → the ``coding`` toolset
+    plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``). Only
+    under the opt-in ``focus`` mode: the default posture is prompt-only and
+    never touches the user's configured toolsets (toolsets like messaging /
+    smart-home / music are off-by-default anyway, and someone who explicitly
+    enabled image-gen or Spotify shouldn't lose it for being in a git repo).
   * **Delegation** — subagents inherit the parent's toolset and run through the
     same prompt builder, so the coding posture propagates to children for free.
   * **Model / memory / compression** — declared on the profile
@@ -33,9 +36,15 @@ drift mid-session, so the brief tells the model to re-check with ``git`` before
 acting on the snapshot. A ``/coding`` flip therefore only takes effect next
 session (deferred), the same contract as ``/skills install`` vs ``--now``.
 
-Activation (config ``agent.coding_context``): ``auto`` (default) turns it on for
-an interactive coding surface sitting in a code workspace (git repo or a
-recognised project root); ``on`` forces it anywhere; ``off`` disables it.
+Activation (config ``agent.coding_context``):
+
+  * ``auto`` (default) — posture (brief + snapshot) on an interactive coding
+    surface sitting in a code workspace (git repo or recognised project root).
+    Prompt-only; toolsets untouched.
+  * ``focus`` — like ``auto``, but additionally collapses the toolset to the
+    ``coding`` set + enabled MCP servers. Explicit opt-in for a lean schema.
+  * ``on`` — force the posture anywhere (incl. non-workspaces). Prompt-only.
+  * ``off`` — disable entirely.
 """
 
 from __future__ import annotations
@@ -159,7 +168,7 @@ def get_profile(name: str) -> ContextProfile:
 
 
 def _coding_mode(config: Optional[dict[str, Any]]) -> str:
-    """Return the normalized ``agent.coding_context`` mode (auto/on/off)."""
+    """Return the normalized ``agent.coding_context`` mode (auto/focus/on/off)."""
     if config is None:
         try:
             from hermes_cli.config import load_config
@@ -169,6 +178,8 @@ def _coding_mode(config: Optional[dict[str, Any]]) -> str:
             config = {}
     raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
     mode = str(raw).strip().lower()
+    if mode in {"focus", "strict", "lean"}:
+        return "focus"
     if mode in {"on", "true", "yes", "1", "always"}:
         return "on"
     if mode in {"off", "false", "no", "0", "never"}:
@@ -214,9 +225,9 @@ def _has_project_marker(cwd: Path) -> bool:
 def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
     """Resolve which profile applies.
 
-    ``auto``: coding when the surface is interactive AND the cwd is a code
-    workspace (a git repo or a recognised project root). ``on``: always coding.
-    ``off``: always general.
+    ``auto``/``focus``: coding when the surface is interactive AND the cwd is a
+    code workspace (a git repo or a recognised project root). ``on``: always
+    coding. ``off``: always general.
 
     Detection is intentionally not memoized: it's a handful of ``stat`` calls,
     and callers resolve the mode once per session anyway. Caching here would
@@ -250,6 +261,9 @@ class RuntimeMode:
     profile: ContextProfile
     surface: str
     cwd: Path
+    # The normalized ``agent.coding_context`` mode this posture was resolved
+    # under (auto/focus/on/off). Toolset collapse is gated on ``focus``.
+    config_mode: str = "auto"
 
     @property
     def kind(self) -> str:
@@ -262,10 +276,17 @@ class RuntimeMode:
     def toolset_selection(self, config: Optional[dict[str, Any]] = None) -> Optional[list[str]]:
         """Toolset list for this posture, or ``None`` to keep the platform default.
 
+        Non-``None`` only under the opt-in ``focus`` mode. The default posture
+        is prompt-only: most strippable toolsets are off-by-default anyway, and
+        a user who explicitly enabled one (image-gen for frontend/game assets,
+        messaging for build notifications, …) keeps it while coding.
+
         Callers apply this only when the user hasn't pinned an explicit
         selection (``--toolsets``, ``HERMES_TUI_TOOLSETS``, …); they never
         override a pin. Returns the profile's toolset plus enabled MCP servers.
         """
+        if self.config_mode != "focus":
+            return None
         if self.profile.toolset is None:
             return None
         return [self.profile.toolset, *_enabled_mcp_servers(config)]
@@ -295,10 +316,16 @@ def resolve_runtime_mode(
     object is immutable and safe to cache for the session.
     """
     resolved_cwd = _resolve_cwd(cwd)
+    mode = _coding_mode(config)
     name = _detect_profile_name(
-        _coding_mode(config), (platform or "").strip().lower(), str(resolved_cwd)
+        mode, (platform or "").strip().lower(), str(resolved_cwd)
     )
-    return RuntimeMode(profile=get_profile(name), surface=platform or "", cwd=resolved_cwd)
+    return RuntimeMode(
+        profile=get_profile(name),
+        surface=platform or "",
+        cwd=resolved_cwd,
+        config_mode=mode,
+    )
 
 
 # ── Back-compat surface (thin wrappers over RuntimeMode) ────────────────────
@@ -320,7 +347,11 @@ def coding_selection(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> Optional[list[str]]:
-    """Toolset selection for the coding posture, or ``None`` when it's off."""
+    """Toolset selection for the coding posture.
+
+    ``None`` unless the user opted into ``focus`` mode AND the posture is
+    active — the default coding posture never overrides configured toolsets.
+    """
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
     ).toolset_selection(config)
