@@ -1,4 +1,4 @@
-"""Tests for agent.coding_context — resolver, toolset substitution, git probe."""
+"""Tests for agent.coding_context — RuntimeMode seam, resolver, toolset, git probe."""
 
 import subprocess
 
@@ -118,3 +118,80 @@ class TestStatusParsing:
         assert counts["modified"] == 1
         assert counts["untracked"] == 1
         assert counts["conflicts"] == 1
+
+
+# ── RuntimeMode seam ────────────────────────────────────────────────────────
+
+class TestRuntimeMode:
+    def test_resolves_coding_in_repo(self, tmp_path):
+        _git_init(tmp_path)
+        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={})
+        assert mode.is_coding is True
+        assert mode.kind == "coding"
+        assert mode.profile is cc.CODING_PROFILE
+
+    def test_resolves_general_outside_workspace(self, tmp_path):
+        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={})
+        assert mode.is_coding is False
+        assert mode.kind == "general"
+        # General posture pins no toolset and injects no blocks.
+        assert mode.toolset_selection() is None
+        assert mode.system_blocks() == []
+
+    def test_is_frozen(self, tmp_path):
+        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={})
+        with pytest.raises(Exception):
+            mode.profile = cc.CODING_PROFILE  # type: ignore[misc]
+
+    def test_system_blocks_include_brief_and_workspace(self, tmp_path):
+        _git_init(tmp_path)
+        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "on"}})
+        blocks = mode.system_blocks()
+        assert any("coding agent" in b for b in blocks)
+        assert any("Workspace" in b for b in blocks)
+
+    def test_toolset_selection_starts_with_coding(self, tmp_path):
+        mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "on"}})
+        sel = mode.toolset_selection()
+        assert sel and sel[0] == cc.CODING_TOOLSET
+
+
+# ── profile registry ────────────────────────────────────────────────────────
+
+class TestProfiles:
+    def test_registered_profiles(self):
+        assert cc.get_profile("coding") is cc.CODING_PROFILE
+        assert cc.get_profile("general") is cc.GENERAL_PROFILE
+
+    def test_unknown_profile_falls_back_to_general(self):
+        assert cc.get_profile("nonsense") is cc.GENERAL_PROFILE
+
+    def test_coding_profile_shape(self):
+        # The coding profile declares the seams other domains read.
+        assert cc.CODING_PROFILE.toolset == cc.CODING_TOOLSET
+        assert cc.CODING_PROFILE.guidance
+        assert cc.CODING_PROFILE.model_hint == "coding"
+        # General is inert.
+        assert cc.GENERAL_PROFILE.toolset is None
+        assert cc.GENERAL_PROFILE.guidance == ""
+
+
+# ── detection signals ───────────────────────────────────────────────────────
+
+class TestDetection:
+    @pytest.mark.parametrize("marker", ["pyproject.toml", "package.json", "go.mod", "AGENTS.md"])
+    def test_project_manifest_triggers_without_git(self, tmp_path, marker):
+        (tmp_path / marker).write_text("x")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_marker_in_parent_counts_from_subdir(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("x")
+        sub = tmp_path / "src" / "pkg"
+        sub.mkdir(parents=True)
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=sub, config=cfg) is True
+
+    def test_bare_dir_is_not_coding(self, tmp_path):
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False

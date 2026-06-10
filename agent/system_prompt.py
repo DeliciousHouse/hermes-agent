@@ -228,17 +228,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cache), so the brief tells the model to re-check git before relying on it.
     if agent.valid_tool_names:
         try:
-            from agent.coding_context import (
-                CODING_AGENT_GUIDANCE,
-                build_coding_workspace_block,
-                is_coding_context,
-            )
+            from agent.coding_context import coding_system_blocks
 
-            if is_coding_context(platform=agent.platform, cwd=resolve_context_cwd()):
-                stable_parts.append(CODING_AGENT_GUIDANCE)
-                _workspace = build_coding_workspace_block(resolve_context_cwd())
-                if _workspace:
-                    stable_parts.append(_workspace)
+            stable_parts.extend(
+                coding_system_blocks(
+                    platform=agent.platform, cwd=resolve_context_cwd()
+                )
+            )
         except Exception:
             # Coding-context probing must never block prompt build.
             pass

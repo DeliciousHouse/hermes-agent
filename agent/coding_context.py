@@ -1,26 +1,41 @@
 """Coding-context awareness — base Hermes, every interactive surface.
 
-When the user runs Hermes inside a code workspace (CLI, TUI, desktop app, or
-an editor over ACP), Hermes shifts into a coding posture:
+When the user runs Hermes inside a code workspace (CLI, TUI, desktop app, or an
+editor over ACP), Hermes shifts into a **coding posture**. This module is the
+single place that decides whether we're in that posture and what it implies,
+so the rest of the codebase never re-derives "are we coding?" on its own.
 
-  1. **Tool restriction** — the toolset collapses to the coding-relevant set
-     (file, terminal, search, web docs, skills, todo, delegate, vision,
-     browser). Messaging / TTS / image-gen / smart-home / music / cron /
-     computer-use fall away — noise the model never needs while pairing on
-     code.
-  2. **Operating brief** — a Cursor-style system block: gather context before
-     editing, make focused diffs, verify, never fabricate.
-  3. **Live workspace snapshot** — git root, branch + upstream (ahead/behind),
-     worktree, dirty/staged counts, and recent commits.
+Architecture — one seam, many consumers
+----------------------------------------
+The posture is modelled as a frozen :class:`RuntimeMode` selected from a small
+:class:`ContextProfile` registry (today: ``coding`` and ``general``). A profile
+is *data* — it declares the toolset to collapse to, the operating brief to
+inject, and hints for other domains (model routing, memory, subagents). Every
+domain reads the same resolved object instead of probing git/config itself:
 
-The snapshot is built ONCE per session at prompt-build time and baked into the
-stable system prompt — never re-probed per turn (that would shatter the prompt
-cache). Branch and dirty state drift mid-session, so the brief tells the model
-to re-check with ``git`` before acting on them.
+  * **Toolset** — ``RuntimeMode.toolset_selection()`` → the ``coding`` toolset
+    plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``). Messaging
+    / TTS / image-gen / smart-home / music / cron / computer-use fall away.
+  * **System prompt** — ``RuntimeMode.system_blocks()`` → the operating brief +
+    a live git/workspace snapshot (``agent/system_prompt.py``).
+  * **Delegation** — subagents inherit the parent's toolset and run through the
+    same prompt builder, so the coding posture propagates to children for free.
+  * **Model / memory / compression** — declared on the profile
+    (``model_hint``, ``memory_policy``) as the extension seam; consumers read
+    ``mode.profile`` rather than re-deciding.
 
-Activation (config ``agent.coding_context``): ``auto`` (default) turns it on
-for interactive coding surfaces sitting in a git repo; ``on`` forces it
-anywhere; ``off`` disables it.
+Cache safety
+------------
+The mode is resolved **once** and is immutable. The workspace snapshot is built
+once at prompt-build time and baked into the *stable* system-prompt tier — never
+re-probed per turn (that would shatter the prompt cache). Branch and dirty state
+drift mid-session, so the brief tells the model to re-check with ``git`` before
+acting on the snapshot. A ``/coding`` flip therefore only takes effect next
+session (deferred), the same contract as ``/skills install`` vs ``--now``.
+
+Activation (config ``agent.coding_context``): ``auto`` (default) turns it on for
+an interactive coding surface sitting in a code workspace (git repo or a
+recognised project root); ``on`` forces it anywhere; ``off`` disables it.
 """
 
 from __future__ import annotations
@@ -28,6 +43,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,34 +52,110 @@ logger = logging.getLogger("hermes.coding_context")
 CODING_TOOLSET = "coding"
 
 # Surfaces where a coding posture makes sense under ``auto``. Messaging
-# platforms (telegram, discord, slack, …) are intentionally absent — a chat
-# bot in a group is not pair-programming.
+# platforms (telegram, discord, slack, …) are intentionally absent — a chat bot
+# in a group is not pair-programming.
 INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", ""}
+
+# Project-root signals that mark a directory as a code workspace even when it
+# isn't (yet) a git repo. Cheap filename checks — no parsing.
+_PROJECT_MARKERS = (
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+    "package.json", "tsconfig.json", "deno.json",
+    "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+    "Gemfile", "composer.json", "mix.exs", "pubspec.yaml",
+    "CMakeLists.txt", "Makefile", "Dockerfile",
+    "AGENTS.md", "CLAUDE.md", ".cursorrules",
+)
 
 _GIT_TIMEOUT = 2.5
 
 
-# Cursor-style operating brief. Tool names referenced here (read_file,
-# search_files, patch, terminal, todo) are in the coding toolset and in
-# _HERMES_CORE_TOOLS, so they're present on every surface this fires on.
+# Cursor-grade operating brief. Tool names referenced here (read_file,
+# search_files, patch, write_file, terminal, todo) are in the coding toolset and
+# in _HERMES_CORE_TOOLS, so they're present on every surface this fires on.
 CODING_AGENT_GUIDANCE = (
     "You are a coding agent pairing with the user inside their codebase. "
-    "Operate like a careful senior engineer:\n"
-    "- Understand before you change: read the relevant files (`read_file`) "
-    "and locate code with `search_files` rather than guessing. Never invent "
-    "files, symbols, or APIs — if you haven't seen it, go look.\n"
-    "- Make focused edits with `patch`/`write_file`; match the project's "
-    "existing style and conventions (AGENTS.md / .cursorrules already in "
-    "context win over your defaults). Touch only what the task needs.\n"
-    "- Use `terminal` for git, builds, tests, and inspection; verify your "
-    "work (run the relevant tests/linter/build) before claiming it's done.\n"
-    "- Track multi-step work with `todo`. Reference code as `path:line` "
-    "rather than pasting whole files.\n"
-    "- Git is the user's, not yours: don't commit, push, or alter history "
-    "unless asked. The Workspace block below is a snapshot from session "
-    "start — re-run `git status`/`git branch` before relying on it.\n"
-    "- Be concise. Lead with the change or answer, not a preamble."
+    "Operate like a careful senior engineer.\n"
+    "\n"
+    "Gather context first:\n"
+    "- Read the relevant files with `read_file` and locate code with "
+    "`search_files` before changing anything. Trace a symbol to its definition "
+    "and usages rather than guessing its shape.\n"
+    "- Never invent files, symbols, APIs, or imports. If you haven't seen it in "
+    "the repo, go look. Don't assume a library is available — check the project "
+    "manifest (pyproject.toml / package.json / Cargo.toml / go.mod) and how "
+    "neighbouring files import it.\n"
+    "\n"
+    "Make changes through the tools, not the chat:\n"
+    "- Edit with `patch`/`write_file`. Do NOT print code blocks to the user as "
+    "a substitute for editing — apply the change, then summarise it. Only show "
+    "code when the user explicitly asks to see it.\n"
+    "- Match the project's existing style and conventions; AGENTS.md / "
+    "CLAUDE.md / .cursorrules already in context win over your defaults. Touch "
+    "only what the task needs, and add any imports/dependencies your code "
+    "requires.\n"
+    "- If an edit fails to apply, re-read the file to get the current exact "
+    "contents before retrying — don't repeat a stale patch.\n"
+    "\n"
+    "Verify, and know when to stop:\n"
+    "- Use `terminal` for git, builds, tests, and inspection. Run the relevant "
+    "tests/linter/build and confirm they pass before claiming the work is done.\n"
+    "- When fixing linter/type errors on a file, stop after about three "
+    "attempts on the same file and ask the user rather than looping.\n"
+    "- Track multi-step work with `todo`. Reference code as `path:line` instead "
+    "of pasting whole files.\n"
+    "\n"
+    "Respect the user's repo: don't commit, push, or rewrite history unless "
+    "asked. The Workspace block below is a snapshot from session start — re-run "
+    "`git status`/`git branch` before relying on it. Be concise: lead with the "
+    "change or answer, not a preamble."
 )
+
+
+# ── Context profiles (declarative posture definitions) ──────────────────────
+
+
+@dataclass(frozen=True)
+class ContextProfile:
+    """A named operating posture. Pure data — consumers read these fields.
+
+    ``toolset``      — collapse to this toolset (+ enabled MCP) when no explicit
+                       selection is pinned; ``None`` keeps the platform default.
+    ``guidance``     — operating brief injected into the stable system prompt;
+                       ``""`` injects nothing.
+    ``model_hint``   — routing preference key for smart model routing
+                       (extension seam; not yet consumed by the router).
+    ``memory_policy``— memory namespace/weighting hint (extension seam).
+    """
+
+    name: str
+    toolset: Optional[str] = None
+    guidance: str = ""
+    model_hint: Optional[str] = None
+    memory_policy: str = "default"
+
+
+GENERAL_PROFILE = ContextProfile(name="general")
+CODING_PROFILE = ContextProfile(
+    name="coding",
+    toolset=CODING_TOOLSET,
+    guidance=CODING_AGENT_GUIDANCE,
+    model_hint="coding",
+    memory_policy="project",
+)
+
+_PROFILES: dict[str, ContextProfile] = {
+    GENERAL_PROFILE.name: GENERAL_PROFILE,
+    CODING_PROFILE.name: CODING_PROFILE,
+}
+
+
+def get_profile(name: str) -> ContextProfile:
+    """Return a registered profile, falling back to ``general``."""
+    return _PROFILES.get(name, GENERAL_PROFILE)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 
 def _coding_mode(config: Optional[dict[str, Any]]) -> str:
@@ -103,25 +195,145 @@ def _git_root(cwd: Path) -> Optional[Path]:
     return None
 
 
+def _has_project_marker(cwd: Path) -> bool:
+    """Cheap check: does cwd (or a parent up to the git root) look like a project?
+
+    Walks up at most a few levels so a manifest in the workspace root counts
+    even when the user is in a subdirectory.
+    """
+    current = cwd.resolve()
+    for depth, parent in enumerate([current, *current.parents]):
+        if depth > 6:
+            break
+        for marker in _PROJECT_MARKERS:
+            if (parent / marker).exists():
+                return True
+    return False
+
+
+def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
+    """Resolve which profile applies.
+
+    ``auto``: coding when the surface is interactive AND the cwd is a code
+    workspace (a git repo or a recognised project root). ``on``: always coding.
+    ``off``: always general.
+
+    Detection is intentionally not memoized: it's a handful of ``stat`` calls,
+    and callers resolve the mode once per session anyway. Caching here would
+    risk a stale posture if a long-lived process (gateway/TUI) serves sessions
+    from different working directories.
+    """
+    if mode == "off":
+        return GENERAL_PROFILE.name
+    if mode == "on":
+        return CODING_PROFILE.name
+    if platform and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
+        return GENERAL_PROFILE.name
+    cwd = Path(cwd_str)
+    if _git_root(cwd) is not None or _has_project_marker(cwd):
+        return CODING_PROFILE.name
+    return GENERAL_PROFILE.name
+
+
+# ── RuntimeMode (the seam) ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RuntimeMode:
+    """The resolved operating posture for a session. Immutable by construction.
+
+    Built once via :func:`resolve_runtime_mode` and consumed by every domain
+    that cares about the coding/general distinction. Never mutate or re-resolve
+    mid-session — that would break the prompt cache.
+    """
+
+    profile: ContextProfile
+    surface: str
+    cwd: Path
+
+    @property
+    def kind(self) -> str:
+        return self.profile.name
+
+    @property
+    def is_coding(self) -> bool:
+        return self.profile.name == CODING_PROFILE.name
+
+    def toolset_selection(self, config: Optional[dict[str, Any]] = None) -> Optional[list[str]]:
+        """Toolset list for this posture, or ``None`` to keep the platform default.
+
+        Callers apply this only when the user hasn't pinned an explicit
+        selection (``--toolsets``, ``HERMES_TUI_TOOLSETS``, …); they never
+        override a pin. Returns the profile's toolset plus enabled MCP servers.
+        """
+        if self.profile.toolset is None:
+            return None
+        return [self.profile.toolset, *_enabled_mcp_servers(config)]
+
+    def system_blocks(self) -> list[str]:
+        """Stable system-prompt blocks for this posture (brief + workspace)."""
+        if not self.is_coding:
+            return []
+        blocks: list[str] = []
+        if self.profile.guidance:
+            blocks.append(self.profile.guidance)
+        workspace = build_coding_workspace_block(self.cwd)
+        if workspace:
+            blocks.append(workspace)
+        return blocks
+
+
+def resolve_runtime_mode(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> RuntimeMode:
+    """Resolve the operating posture once. Cheap; detection is memoized.
+
+    This is the single entry point every domain should call. The returned
+    object is immutable and safe to cache for the session.
+    """
+    resolved_cwd = _resolve_cwd(cwd)
+    name = _detect_profile_name(
+        _coding_mode(config), (platform or "").strip().lower(), str(resolved_cwd)
+    )
+    return RuntimeMode(profile=get_profile(name), surface=platform or "", cwd=resolved_cwd)
+
+
+# ── Back-compat surface (thin wrappers over RuntimeMode) ────────────────────
+
+
 def is_coding_context(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> bool:
-    """Whether Hermes should operate in its coding posture right now.
+    """Whether Hermes should operate in its coding posture right now."""
+    return resolve_runtime_mode(platform=platform, cwd=cwd, config=config).is_coding
 
-    ``auto`` (default): true for an interactive coding surface sitting in a
-    git repo. ``on``: always true. ``off``: always false.
-    """
-    mode = _coding_mode(config)
-    if mode == "off":
-        return False
-    if mode == "on":
-        return True
-    if platform is not None and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
-        return False
-    return _git_root(_resolve_cwd(cwd)) is not None
+
+def coding_selection(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> Optional[list[str]]:
+    """Toolset selection for the coding posture, or ``None`` when it's off."""
+    return resolve_runtime_mode(
+        platform=platform, cwd=cwd, config=config
+    ).toolset_selection(config)
+
+
+def coding_system_blocks(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> list[str]:
+    """Stable system-prompt blocks for the current posture (empty when general)."""
+    return resolve_runtime_mode(platform=platform, cwd=cwd, config=config).system_blocks()
 
 
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
@@ -145,21 +357,7 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
         return []
 
 
-def coding_selection(
-    *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-) -> Optional[list[str]]:
-    """The toolset selection for the coding posture, or ``None`` when it's off.
-
-    Callers apply this only when the user hasn't pinned an explicit selection
-    (a ``--toolsets`` flag, ``HERMES_TUI_TOOLSETS``, …); they never override
-    a pin. Returns the coding toolset plus the user's enabled MCP servers.
-    """
-    if not is_coding_context(platform=platform, cwd=cwd, config=config):
-        return None
-    return [CODING_TOOLSET, *_enabled_mcp_servers(config)]
+# ── git/workspace probe ─────────────────────────────────────────────────────
 
 
 def _git(cwd: Path, *args: str) -> str:

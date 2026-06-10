@@ -84,7 +84,8 @@ class TestCodingContextBlock:
         subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        with patch("agent.coding_context.is_coding_context", return_value=False):
+        # Drive the real path: force the resolved mode to "off" via config.
+        with patch("agent.coding_context._coding_mode", return_value="off"):
             stable = _stable_prompt(agent)
         assert "coding agent" not in stable
 
