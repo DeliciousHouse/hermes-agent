@@ -1,0 +1,452 @@
+diff --git a/docs/kanban/multi-gateway.md b/docs/kanban/multi-gateway.md
+index 126e39823..f249206b5 100644
+--- a/docs/kanban/multi-gateway.md
++++ b/docs/kanban/multi-gateway.md
+@@ -4,17 +4,32 @@ Hermes supports multiple gateway processes running concurrently — one per prof
+ (default, writer, admin, coder, researcher). Each gateway opens its own connection
+ to platform APIs and delivers messages for its profile's subscribers.
+ 
+-## Single-dispatcher posture
++## Independent dispatcher and notifier ownership
+ 
+-Only one gateway owns the kanban dispatcher. The owning gateway keeps
++Only one gateway owns the kanban dispatcher. The dispatch-owning gateway keeps
+ `kanban.dispatch_in_gateway: true` (the default); every other gateway sets it
+ to `false`.
+ 
+-**Why this matters:** a gateway with `dispatch_in_gateway: true` opens per-board
+-SQLite connections for both the dispatcher and the notifier watcher. Multiple
+-gateways doing this concurrently multiplies the open file descriptors on each
+-`kanban.db` and amplifies WAL `-shm` reader contention. Gating both paths on the
+-same flag means exactly one process touches the kanban DBs.
++Notification ownership is separate. Every gateway with a connected adapter is
++eligible for a machine-global notifier lease, regardless of
++`kanban.dispatch_in_gateway`. The first eligible gateway to acquire
++`<kanban-home>/kanban/.notifier.lock` becomes the notifier owner and polls all
++boards. Other gateways keep retrying the lease but do **not** enumerate or open
++board DBs while they are non-owners. If the owner exits, the OS releases the
++advisory lock and a waiting gateway takes over.
++
++Subscriptions remain stamped with the profile that created them
++(`notifier_profile`). The elected owner routes through that profile's adapter
++when it hosts one, preserving profile isolation; subscriptions stamped
++`default` continue to use the default adapter. For installations with disjoint
++profile gateways, start the intended connected-adapter gateway first, or use a
++multiplex gateway that hosts the profiles whose subscriptions it must deliver.
++
++**Why this matters:** tying notifier startup to `dispatch_in_gateway` makes
++`dispatch_in_gateway: false` silently disable completion and blocked-event
++delivery. Letting every gateway poll independently fixes delivery but makes N
++processes open every SQLite board. The separate lease preserves notifier-only
++operation while keeping exactly one board-polling process.
+ 
+ ## Configuration
+ 
+@@ -30,10 +45,12 @@ Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
+ 
+ ## What each gateway does
+ 
+-| Gateway role | dispatch_in_gateway | Opens per-board DBs? | Runs dispatcher + notifier? |
+-|---|---|---|---|
+-| default (dispatch owner) | true (default) | yes | yes |
+-| writer, admin, coder, etc. | false | no | no |
++| Gateway role | dispatch_in_gateway | Opens per-board DBs? | Runs dispatcher? | Runs notifier? |
++|---|---|---|---|---|
++| dispatch owner + notifier lease owner | true (default) | yes | yes | yes |
++| dispatcher-only gateway (notifier lease held elsewhere) | true | yes, for dispatch | yes | waits for lease |
++| notifier-only lease owner | false | yes | no | yes |
++| connected non-owner | false | no | no | waits for lease |
+ 
+-Non-dispatch gateways still deliver messages for their own platform adapters
+-(Telegram, Discord, etc.) — they just don't poll kanban boards.
++The notifier lease does not enable dispatch and the dispatcher flag does not
++grant the notifier lease. These are two independent ownership decisions.
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 50e44f980..61ad519b7 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -58,15 +58,12 @@ def _resolve_auto_decompose_settings(
+ 
+ 
+ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
+-    """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
++    """Take an exclusive, non-blocking gateway watcher lock.
+ 
+-    Only one gateway process machine-wide may run the embedded kanban
+-    dispatcher: concurrent dispatchers double the reclaim frequency (each
+-    runs its own ``release_stale_claims`` → promote → dispatch loop), double
+-    claim-attempt events in the event log, and — with ``wal_autocheckpoint=0`` —
+-    concurrent manual WAL checkpoints can corrupt index pages. The
+-    ``dispatch_in_gateway`` config flag is the primary control; this lock is the
+-    backstop that survives config drift and same-profile restart races.
++    Multiple gateways can legitimately run on one machine while sharing one
++    kanban root. The dispatcher uses this helper as a backstop against config
++    drift and restart races; the notifier uses a separate lock as its primary
++    owner election, independent from dispatcher configuration.
+ 
+     Delegates to :func:`gateway.status._try_acquire_file_lock` (``fcntl`` on
+     POSIX, ``msvcrt`` on Windows) so the guard is cross-platform.
+@@ -74,10 +71,12 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
+     Returns ``(handle, "held")`` on success — the caller keeps the file handle
+     for the process lifetime and **must** release it via
+     :func:`_release_singleton_lock` when done. ``(None, "contended")`` when
+-    another process holds the lock (caller must NOT dispatch). ``(None,
++    another process holds the lock (caller must not perform the guarded work).
++    ``(None,
+     "unavailable")`` when locking cannot be performed (non-POSIX filesystem
+-    without flock, or the status.py helpers are unimportable) — caller falls
+-    back to config-only control.
++    without flock, or the status.py helpers are unimportable). Each caller
++    chooses its safety posture: dispatcher uses config-only control, while the
++    notifier waits rather than polling without ownership.
+     """
+     try:
+         from gateway.status import _try_acquire_file_lock  # deferred; same package
+@@ -95,7 +94,7 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
+ 
+ 
+ def _release_singleton_lock(handle) -> None:
+-    """Release a dispatcher singleton lock acquired via :func:`_acquire_singleton_lock`."""
++    """Release a lock acquired via :func:`_acquire_singleton_lock`."""
+     if handle is None:
+         return
+     try:
+@@ -113,11 +112,82 @@ class GatewayKanbanWatchersMixin:
+     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+ 
+     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
++        """Elect one notifier owner, then run its board-polling loop.
++
++        This lease is deliberately independent from
++        ``kanban.dispatch_in_gateway``: a notifier-only gateway can own it,
++        while every non-owner waits without opening any board DB. The advisory
++        lock is released by the OS if the owner exits, so a waiting connected
++        gateway can take over on its next retry.
++        """
++        try:
++            from hermes_cli import kanban_db as _kb
++        except Exception:
++            logger.warning(
++                "kanban notifier: kanban_db not importable; notifier disabled"
++            )
++            return
++
++        def _has_connected_adapter() -> bool:
++            if self.adapters:
++                return True
++            return any(
++                profile_adapters
++                for profile_adapters in getattr(self, "_profile_adapters", {}).values()
++            )
++
++        # Let gateway startup finish wiring adapters before electing an owner.
++        await asyncio.sleep(5)
++        if not self._running:
++            return
++
++        notifier_lock_path = _kb.kanban_home() / "kanban" / ".notifier.lock"
++        self._kanban_notifier_lock_handle = getattr(
++            self, "_kanban_notifier_lock_handle", None
++        )
++        warned_unavailable = False
++        retry_delay = min(1.0, max(0.1, float(interval)))
++        while self._running and self._kanban_notifier_lock_handle is None:
++            if not _has_connected_adapter():
++                logger.debug(
++                    "kanban notifier: no connected adapters; waiting to elect owner"
++                )
++                await asyncio.sleep(retry_delay)
++                continue
++
++            lock_handle, lock_state = _acquire_singleton_lock(notifier_lock_path)
++            if lock_state == "held":
++                self._kanban_notifier_lock_handle = lock_handle
++                logger.info(
++                    "kanban notifier: acquired machine-global lease (%s)",
++                    notifier_lock_path,
++                )
++                break
++            if lock_state == "unavailable" and not warned_unavailable:
++                logger.warning(
++                    "kanban notifier: singleton lock unavailable; waiting "
++                    "instead of polling board DBs without ownership"
++                )
++                warned_unavailable = True
++            elif lock_state == "contended":
++                logger.debug("kanban notifier: another gateway owns the notifier lease")
++            await asyncio.sleep(retry_delay)
++
++        if not self._running:
++            return
++
++        try:
++            await self._kanban_notifier_owner_loop(interval=interval)
++        finally:
++            _release_singleton_lock(self._kanban_notifier_lock_handle)
++            self._kanban_notifier_lock_handle = None
++
++    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
+         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+ 
+         For each subscription row, fetches ``task_events`` newer than the
+-        stored cursor with kind in the terminal set (``completed``,
+-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
++        stored cursor with kind in the notifiable set (``completed``,
++        ``blocked``, ``scheduled``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
+         message per new event to ``(platform, chat_id, thread_id)``,
+         then advances the cursor. When a task reaches a terminal state
+         (``completed`` / ``archived``), the subscription is removed.
+@@ -130,31 +200,11 @@ class GatewayKanbanWatchersMixin:
+         tick. Subscriptions live inside each board's own DB and cannot
+         cross boards, so delivery semantics are unchanged — this is
+         purely a fan-out of the single-DB poll.
++
++        Notification delivery is intentionally independent from embedded
++        dispatch. A gateway may own the user's chat subscription while task
++        execution is owned by another dispatcher process.
+         """
+-        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
+-        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
+-        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
+-        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
+-        try:
+-            from hermes_cli.config import load_config as _load_config
+-        except Exception:
+-            logger.warning("kanban notifier: config loader unavailable; disabled")
+-            return
+-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+-        if env_override in {"0", "false", "no", "off"}:
+-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+-            return
+-        try:
+-            cfg = _load_config()
+-        except Exception as exc:
+-            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
+-            return
+-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+-        if not kanban_cfg.get("dispatch_in_gateway", True):
+-            logger.info(
+-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+-            )
+-            return
+         from gateway.config import Platform as _Platform
+         try:
+             from hermes_cli import kanban_db as _kb
+@@ -164,7 +214,17 @@ class GatewayKanbanWatchersMixin:
+ 
+         # "status" covers dashboard drag-drop and `_set_status_direct()`
+         # writes — surface those transitions to subscribers too.
+-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
++        NOTIFIABLE_KINDS = (
++            "completed",
++            "blocked",
++            "scheduled",
++            "gave_up",
++            "crashed",
++            "timed_out",
++            "status",
++            "archived",
++            "unblocked",
++        )
+         # Subscriptions are removed only when the task reaches a truly final
+         # status (done / archived). We used to also unsub on any terminal
+         # event kind (gave_up / crashed / timed_out / blocked), but that
+@@ -191,9 +251,6 @@ class GatewayKanbanWatchersMixin:
+             notifier_profile = self._active_profile_name()
+             self._kanban_notifier_profile = notifier_profile
+ 
+-        # Initial delay so the gateway can finish wiring adapters.
+-        await asyncio.sleep(5)
+-
+         while self._running:
+             try:
+                 def _collect():
+@@ -202,6 +259,13 @@ class GatewayKanbanWatchersMixin:
+                         getattr(platform, "value", str(platform)).lower()
+                         for platform in self.adapters.keys()
+                     }
++                    for profile_adapters in getattr(
++                        self, "_profile_adapters", {}
++                    ).values():
++                        active_platforms.update(
++                            getattr(platform, "value", str(platform)).lower()
++                            for platform in profile_adapters.keys()
++                        )
+                     if not active_platforms:
+                         logger.debug("kanban notifier: no connected adapters; skipping tick")
+                         return deliveries
+@@ -274,7 +338,7 @@ class GatewayKanbanWatchersMixin:
+                                     platform=sub["platform"],
+                                     chat_id=sub["chat_id"],
+                                     thread_id=sub.get("thread_id") or "",
+-                                    kinds=TERMINAL_KINDS,
++                                    kinds=NOTIFIABLE_KINDS,
+                                 )
+                                 if not events:
+                                     continue
+@@ -376,8 +440,13 @@ class GatewayKanbanWatchersMixin:
+                         elif kind == "blocked":
+                             reason = ""
+                             if ev.payload and ev.payload.get("reason"):
+-                                reason = f": {str(ev.payload['reason'])[:160]}"
++                                reason = f": {str(ev.payload['reason'])}"
+                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
++                        elif kind == "scheduled":
++                            reason = ""
++                            if ev.payload and ev.payload.get("reason"):
++                                reason = f": {str(ev.payload['reason'])}"
++                            msg = f"⏰ {board_tag}{tag}Kanban {sub['task_id']} scheduled{reason}"
+                         elif kind == "gave_up":
+                             err = ""
+                             if ev.payload and ev.payload.get("error"):
+@@ -405,7 +474,7 @@ class GatewayKanbanWatchersMixin:
+                                 new_status = str(ev.payload["status"])
+                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                         else:
+-                            # archived / unblocked are claimed by TERMINAL_KINDS
++                            # archived / unblocked are claimed by NOTIFIABLE_KINDS
+                             # (so the cursor advances past them and they can't
+                             # wedge a later completed/blocked event behind an
+                             # unclaimed row) but are intentionally SILENT: an
+@@ -444,6 +513,10 @@ class GatewayKanbanWatchersMixin:
+                             # the self-post outcome, not by skipping the send.
+                             continue
+                         try:
++                            # Preserve the complete event payload here. Platform
++                            # adapters own their transport limits (Telegram and
++                            # Discord chunk in ``send``), so notifier-level
++                            # truncation would silently drop decision fields.
+                             _send_res = await adapter.send(
+                                 sub["chat_id"], msg, metadata=metadata,
+                             )
+@@ -535,7 +608,14 @@ class GatewayKanbanWatchersMixin:
+                         #   claim exactly like a failed send() above, so the
+                         #   next tick retries.
+                         task_terminal = task and task.status in {"done", "archived"}
+-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
++                        _WAKE_KINDS = (
++                            "completed",
++                            "gave_up",
++                            "crashed",
++                            "timed_out",
++                            "blocked",
++                            "scheduled",
++                        )
+                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                         from gateway.wake import adapter_supports_push as _adapter_push_ok
+ 
+@@ -553,6 +633,7 @@ class GatewayKanbanWatchersMixin:
+                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
+                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
++                            if "scheduled" in _wake_kinds: _parts.append("scheduled")
+                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                             _synth = t(
+                                 "gateway.kanban.wake.message",
+@@ -562,6 +643,38 @@ class GatewayKanbanWatchersMixin:
+                                 assignee=_assignee,
+                                 board=board_slug,
+                             )
++                            if not _is_push_adapter and _wake_kinds.intersection(
++                                {"blocked", "scheduled"}
++                            ):
++                                _decision_reasons = [
++                                    str(ev.payload["reason"])
++                                    for ev in d["events"]
++                                    if ev.kind in {"blocked", "scheduled"}
++                                    and ev.payload
++                                    and ev.payload.get("reason")
++                                ]
++                                if _decision_reasons:
++                                    _synth = "\n\n".join([_synth, *_decision_reasons])
++
++                        if not _is_push_adapter and _wake_kinds and not _session_key:
++                            # A stateless adapter has no text-push fallback: the
++                            # self-post is the only delivery. Without a session
++                            # target, keep the event unseen rather than advancing
++                            # its cursor past a notification nobody received.
++                            logger.warning(
++                                "kanban notifier: cannot wake %s on %s without "
++                                "a task session; rewinding claim",
++                                sub["task_id"],
++                                platform_str,
++                            )
++                            await asyncio.to_thread(
++                                self._kanban_rewind,
++                                sub,
++                                d["cursor"],
++                                d.get("old_cursor", 0),
++                                board_slug,
++                            )
++                            continue
+ 
+                         if not _is_push_adapter and _wake_kinds and _session_key:
+                             # Wake self-post IS the delivery on this path —
+@@ -625,7 +738,7 @@ class GatewayKanbanWatchersMixin:
+                         # gave_up / crashed / timed_out the subscription is
+                         # kept alive so the user gets notified again if the
+                         # dispatcher respawns the task and it cycles into the
+-                        # same state. See the longer comment on TERMINAL_KINDS
++                        # same state. See the longer comment on NOTIFIABLE_KINDS
+                         # above for the failure mode this prevents.
+                         if _is_push_adapter and _wake_kinds and _session_key:
+                             try:
+diff --git a/gateway/run.py b/gateway/run.py
+index aac6a1925..494649add 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3521,6 +3521,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # injected only when the live state differs from this value.
+         self._session_vc_last: Dict[str, str] = {}
+         self._kanban_notifier_profile = self._active_profile_name()
++        # Notifier ownership is machine-global and independent from embedded
++        # dispatcher ownership. The watcher holds this advisory lease for its
++        # lifetime so only one connected gateway polls every board DB.
++        self._kanban_notifier_lock_handle = None
+         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
+         self._teams_pipeline_runtime = None
+         self._teams_pipeline_runtime_error: Optional[str] = None
+@@ -8568,9 +8572,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # Start background session expiry watcher to finalize expired sessions
+         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
+ 
+-        # Start background kanban notifier — delivers `completed`, `blocked`,
+-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
+-        # so human-in-the-loop workflows hear back without polling.
++        # Start background kanban notifier — delivers completion, blocked,
++        # scheduled, and worker-failure events to gateway subscribers so
++        # human-in-the-loop workflows hear back without polling.
+         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+ 
+         # Start background kanban dispatcher — spawns workers for ready
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2b6840924..16c55c394 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -242,6 +242,15 @@ the old standalone daemon alive for one release cycle, but running both
+ a gateway-embedded dispatcher AND a standalone daemon against the same
+ `kanban.db` causes claim races and is not supported.
+ 
++The gateway's notification watcher has separate ownership. Connected gateways
++contend for a machine-global notifier lease; only the lease owner polls board
++DBs and delivers subscribed completion/block events. Non-owners wait without
++opening boards for notification polling. This means
++`kanban.dispatch_in_gateway: false` disables worker dispatch without disabling
++notifications, and a notifier-only gateway can take over the lease if the
++current owner exits. Subscriptions still route through their stamped
++`notifier_profile`, including the default adapter for `notifier_profile=default`.
++
+ ### Idempotent create (for automation / webhooks)
+ 
+ ```bash
+@@ -860,7 +869,9 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
+ 
+ ## Gateway notifications
+ 
+-When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
++When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The machine-global notifier lease owner polls `task_events` every few seconds and delivers one message per notifiable event (`completed`, `blocked`, `scheduled`, `gave_up`, `crashed`, `timed_out`) to that chat. Notifier ownership is independent from `kanban.dispatch_in_gateway`; non-owner gateways wait for the lease without polling board DBs. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
++
++`blocked`/`needs_input` and `scheduled` notifications preserve the complete decision brief from the event reason. Fields such as `ASK`, `WHY GATED`, `SCOPE`, `ROLLBACK`, `REPLY`, and a scheduled `WINDOW` are delivered without notifier-side truncation; the platform adapter handles any transport-specific chunking. For non-push clients such as the API server, the equivalent session wake must succeed before the notification cursor advances. A failed wake rewinds the claim for retry, and a scheduled event without a session target remains unseen rather than being marked delivered.
+ 
+ You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
+ 
