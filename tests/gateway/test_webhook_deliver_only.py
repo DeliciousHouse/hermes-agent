@@ -21,7 +21,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 
@@ -41,6 +41,7 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application()
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post("/p/{profile}/webhooks/{route_name}", adapter._handle_webhook)
     return app
 
 
@@ -175,6 +176,119 @@ class TestDeliverOnlyBypassesAgent:
             "thread_id": "topic-42"
         }
 
+    @pytest.mark.asyncio
+    async def test_prefixed_profile_routes_direct_delivery_to_its_adapter(
+        self, monkeypatch
+    ):
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "coder-chat"},
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        default_target = AsyncMock()
+        default_target.send = AsyncMock(return_value=SendResult(success=True))
+        coder_target = AsyncMock()
+        coder_target.send = AsyncMock(return_value=SendResult(success=True))
+        runner = MagicMock()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.TELEGRAM: default_target}
+        runner._profile_adapters = {
+            "coder": {Platform.TELEGRAM: coder_target}
+        }
+        adapter.gateway_runner = runner
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", None), ("coder", None)],
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/p/coder/webhooks/r",
+                json={},
+                headers={"X-GitHub-Delivery": "profile-direct"},
+            )
+
+        assert response.status == 200
+        coder_target.send.assert_awaited_once()
+        default_target.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefixed_profile_home_fallback_uses_its_adapter_config(
+        self, monkeypatch
+    ):
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        default_target = AsyncMock()
+        default_target.send = AsyncMock(return_value=SendResult(success=True))
+        default_target.config = PlatformConfig(
+            home_channel=HomeChannel(
+                platform=Platform.TELEGRAM,
+                chat_id="default-home",
+                name="Default",
+            )
+        )
+        coder_target = AsyncMock()
+        coder_target.send = AsyncMock(return_value=SendResult(success=True))
+        coder_target.config = PlatformConfig(
+            home_channel=HomeChannel(
+                platform=Platform.TELEGRAM,
+                chat_id="coder-home",
+                name="Coder",
+            )
+        )
+        runner = MagicMock()
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    home_channel=HomeChannel(
+                        platform=Platform.TELEGRAM,
+                        chat_id="default-home",
+                        name="Default",
+                    )
+                )
+            },
+        )
+        runner.adapters = {Platform.TELEGRAM: default_target}
+        runner._profile_adapters = {
+            "coder": {Platform.TELEGRAM: coder_target}
+        }
+        adapter.gateway_runner = runner
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", None), ("coder", None)],
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/p/coder/webhooks/r",
+                json={},
+                headers={"X-GitHub-Delivery": "profile-home-fallback"},
+            )
+
+        assert response.status == 200
+        coder_target.send.assert_awaited_once()
+        assert coder_target.send.await_args.args[0] == "coder-home"
+        default_target.send.assert_not_awaited()
+
 
 # ===================================================================
 # HTTP status codes
@@ -212,6 +326,36 @@ class TestDeliverOnlyStatusCodes:
             # Generic error — no adapter-level detail leaks
             assert data["error"] == "Delivery failed"
             assert "rate limited" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_releases_id_for_provider_retry(self):
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(routes)
+        mock_target = _wire_mock_target(adapter)
+        mock_target.send = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="temporary"),
+                SendResult(success=True),
+            ]
+        )
+
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "d-retry-1"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/r", json={}, headers=headers)
+            second = await cli.post("/webhooks/r", json={}, headers=headers)
+
+        assert first.status == 502
+        assert second.status == 200
+        assert mock_target.send.await_count == 2
 
     @pytest.mark.asyncio
     async def test_delivery_exception_returns_502(self):

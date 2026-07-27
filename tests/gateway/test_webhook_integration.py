@@ -139,7 +139,8 @@ class TestGitHubPRWebhook:
         assert "Add webhook adapter" in event.text
         assert event.source.chat_type == "webhook"
         assert event.source.platform == Platform.WEBHOOK
-        assert "github-pr" in event.source.chat_id
+        assert event.source.chat_id.startswith("webhook:")
+        assert event.source.chat_name == "webhook/github-pr"
         assert event.message_id == "gh-delivery-001"
 
 
@@ -248,8 +249,8 @@ class TestCrossPlatformDelivery:
             assert resp.status == 202
 
         # The adapter should have stored delivery info
-        chat_id = "webhook:alerts:alert-001"
-        assert chat_id in adapter._delivery_info
+        assert len(adapter._delivery_info) == 1
+        chat_id = next(iter(adapter._delivery_info))
 
         # Now call send() as if the agent has finished
         result = await adapter.send(chat_id, "I've acknowledged the alert.")
@@ -300,8 +301,8 @@ class TestGitHubCommentDelivery:
             )
             assert resp.status == 202
 
-        chat_id = "webhook:pr-bot:gh-comment-001"
-        assert chat_id in adapter._delivery_info
+        assert len(adapter._delivery_info) == 1
+        chat_id = next(iter(adapter._delivery_info))
 
         # Verify deliver_extra was rendered with payload data
         delivery = adapter._delivery_info[chat_id]

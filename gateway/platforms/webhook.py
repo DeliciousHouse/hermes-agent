@@ -38,10 +38,13 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -144,6 +147,18 @@ def check_webhook_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+@dataclass(frozen=True)
+class _DeliveryReservation:
+    """One in-flight or consumed webhook delivery admission."""
+
+    key: tuple[str, str, str, str]
+    delivery_id: str
+    generation: int
+    owner_token: str
+    session_chat_id: str
+    created_at: float
+
+
 class WebhookAdapter(BasePlatformAdapter):
     """Generic webhook receiver that triggers agent runs from HTTP POSTs."""
 
@@ -183,15 +198,29 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+        # Delivery metadata must outlive the idempotency reservation while its
+        # generation is still running.  A provider retry admitted after TTL gets
+        # a new session key, but pruning the old session's target here would make
+        # its eventual final response silently fall back to log delivery.
+        self._active_delivery_sessions: set[str] = set()
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
 
-        # Idempotency: TTL cache of recently processed delivery IDs.
-        # Prevents duplicate agent runs when webhook providers retry.
-        self._seen_deliveries: Dict[str, float] = {}
-        self._idempotency_ttl: int = 3600  # 1 hour
-        self._seen_deliveries_next_prune_at: float = 0.0
+        # Idempotency reservations are namespaced by the full inbound identity:
+        # (effective profile, route, provider, provider delivery ID).  A lock
+        # makes check+reserve atomic even if requests are handled by different
+        # event loops/threads.  The random owner token protects cleanup from an
+        # expired generation deleting a newer retry's reservation.
+        self._delivery_reservations: Dict[
+            tuple[str, str, str, str], _DeliveryReservation
+        ] = {}
+        self._delivery_reservation_lock = threading.Lock()
+        self._delivery_generation = 0
+        self._idempotency_ttl: int = max(
+            0, int(config.extra.get("idempotency_ttl_seconds", 3600))
+        )
+        self._delivery_reservations_next_prune_at: float = 0.0
 
         # Rate limiting: per-route timestamps in a fixed window.
         self._rate_counts: Dict[str, Deque[float]] = {}
@@ -329,12 +358,14 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
-        stored during webhook receipt is read with ``.get()`` (not popped)
+        ``chat_id`` is a framed, generation-specific internal delivery key.
+        Delivery info stored during webhook receipt is read with ``.get()``
+        (not popped)
         so that interim status messages emitted before the final response
         — fallback-model notifications, context-pressure warnings, etc. —
         do not consume the entry and silently downgrade the final response
-        to the ``log`` deliver type.  TTL cleanup happens on POST.
+        to the ``log`` deliver type. Completion removes active metadata, while
+        TTL cleanup on later POSTs reaps abandoned inactive entries.
         """
         delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
@@ -357,7 +388,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 pass
         if self.gateway_runner and _is_known_platform:
             return await self._deliver_cross_platform(
-                deliver_type, content, delivery
+                deliver_type,
+                content,
+                delivery,
+                profile=delivery.get("profile"),
+                profile_is_primary=delivery.get("profile_is_primary"),
             )
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
@@ -368,7 +403,7 @@ class WebhookAdapter(BasePlatformAdapter):
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
 
-        Mirrors the cleanup pattern used for ``_seen_deliveries``.  Called
+        Mirrors the cleanup pattern used for delivery reservations. Called
         on each POST so the dict size is bounded by ``rate_limit * TTL``
         even if many webhooks fire and never receive a final response.
         """
@@ -380,22 +415,102 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             )
         cutoff = now - self._idempotency_ttl
+        retained_active: list[tuple[float, str]] = []
         while self._delivery_info_order and self._delivery_info_order[0][0] < cutoff:
             created_at, key = self._delivery_info_order.popleft()
             if self._delivery_info_created.get(key) != created_at:
                 continue
+            if key in self._active_delivery_sessions:
+                retained_active.append((created_at, key))
+                continue
             self._delivery_info.pop(key, None)
             self._delivery_info_created.pop(key, None)
+        self._delivery_info_order.extendleft(reversed(retained_active))
 
-    def _prune_seen_deliveries(self, now: float) -> None:
-        """Occasionally prune expired delivery IDs without scanning every POST."""
-        if now < self._seen_deliveries_next_prune_at:
+    @staticmethod
+    def _delivery_identity(request: "web.Request") -> tuple[str, str]:
+        """Return ``(provider, raw delivery ID)`` using stable header priority."""
+        for header, provider in (
+            ("X-GitHub-Delivery", "github"),
+            ("svix-id", "svix"),
+            ("X-Request-ID", "generic"),
+        ):
+            value = request.headers.get(header)
+            if value:
+                return provider, str(value)
+        return "generated", secrets.token_urlsafe(24)
+
+    @staticmethod
+    def _session_chat_id_for_delivery(
+        key: tuple[str, str, str, str], generation: int
+    ) -> str:
+        """Encode a delivery generation injectively for an internal session key."""
+        framed = json.dumps(
+            [*key, generation], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(framed).decode("ascii").rstrip("=")
+        return f"webhook:{encoded}"
+
+    def _prune_delivery_reservations_locked(self, now: float) -> None:
+        """Prune expired reservations while the admission lock is held."""
+        if now < self._delivery_reservations_next_prune_at:
             return
         cutoff = now - self._idempotency_ttl
-        stale = [k for k, t in self._seen_deliveries.items() if t < cutoff]
-        for k in stale:
-            self._seen_deliveries.pop(k, None)
-        self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
+        stale = [
+            key
+            for key, reservation in self._delivery_reservations.items()
+            if reservation.created_at < cutoff
+        ]
+        for key in stale:
+            self._delivery_reservations.pop(key, None)
+        self._delivery_reservations_next_prune_at = now + min(
+            60.0, max(1.0, self._idempotency_ttl / 10)
+        )
+
+    def _reserve_delivery(
+        self,
+        *,
+        profile: str,
+        route: str,
+        provider: str,
+        delivery_id: str,
+        now: float,
+    ) -> Optional[_DeliveryReservation]:
+        """Atomically reserve a delivery, returning ``None`` for a live duplicate."""
+        key = (profile, route, provider, delivery_id)
+        with self._delivery_reservation_lock:
+            existing = self._delivery_reservations.get(key)
+            if (
+                existing is not None
+                and now - existing.created_at < self._idempotency_ttl
+            ):
+                return None
+            self._delivery_generation += 1
+            reservation = _DeliveryReservation(
+                key=key,
+                delivery_id=delivery_id,
+                generation=self._delivery_generation,
+                owner_token=secrets.token_urlsafe(18),
+                session_chat_id=self._session_chat_id_for_delivery(
+                    key, self._delivery_generation
+                ),
+                created_at=now,
+            )
+            self._delivery_reservations[key] = reservation
+            if len(self._delivery_reservations) > max(self._rate_limit * 2, 128):
+                self._prune_delivery_reservations_locked(now)
+            return reservation
+
+    def _release_delivery(self, reservation: _DeliveryReservation) -> None:
+        """Release only the reservation generation owned by this request."""
+        with self._delivery_reservation_lock:
+            current = self._delivery_reservations.get(reservation.key)
+            if (
+                current is not None
+                and current.generation == reservation.generation
+                and hmac.compare_digest(current.owner_token, reservation.owner_token)
+            ):
+                self._delivery_reservations.pop(reservation.key, None)
 
     def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
         """Return True if route is still within limit after recording this hit."""
@@ -410,18 +525,6 @@ class WebhookAdapter(BasePlatformAdapter):
         if len(window) >= self._rate_limit:
             return False
         window.append(now)
-        return True
-
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
-        """Return True when this delivery should be processed."""
-        seen_at = self._seen_deliveries.get(delivery_id)
-        if seen_at is not None and now - seen_at < self._idempotency_ttl:
-            return False
-        if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
-        if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
-            self._prune_seen_deliveries(now)
         return True
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -537,6 +640,27 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"error": "Unknown or unconfigured profile"}, status=404
             )
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            primary_profile = get_active_profile_name()
+        except Exception:
+            primary_profile = "default"
+        effective_profile = profile if isinstance(profile, str) else primary_profile
+        profile_is_primary = effective_profile == primary_profile
+        from hermes_constants import get_hermes_home
+
+        if profile_is_primary:
+            # The active profile may be a custom HERMES_HOME that has no named
+            # directory under profiles/. Its live home is the source of truth.
+            effective_profile_home = get_hermes_home()
+        else:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+
+                effective_profile_home = get_profile_dir(effective_profile)
+            except Exception:
+                effective_profile_home = get_hermes_home()
 
         if not route_config:
             return web.json_response(
@@ -645,8 +769,42 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        allowed_branches = route_config.get("branches", [])
+        if allowed_branches:
+            branch = payload.get("branch") or payload.get("target_branch") or ""
+            ref = payload.get("ref")
+            if not branch and isinstance(ref, str):
+                branch = ref.removeprefix("refs/heads/")
+            pull_request = payload.get("pull_request")
+            if not branch and isinstance(pull_request, dict):
+                base = pull_request.get("base")
+                if isinstance(base, dict):
+                    branch = base.get("ref", "")
+            attributes = payload.get("object_attributes")
+            if not branch and isinstance(attributes, dict):
+                branch = attributes.get("target_branch", "")
+            if branch not in allowed_branches:
+                logger.debug(
+                    "[webhook] Ignoring branch %s for route %s (allowed: %s)",
+                    branch,
+                    route_name,
+                    allowed_branches,
+                )
+                return web.json_response(
+                    {
+                        "status": "ignored",
+                        "reason": "branch",
+                        "branch": branch,
+                        "route": route_name,
+                    }
+                )
+
         if not self._route_processor.route_filters_match(
-            route_config, payload, event_type, request.headers
+            route_config,
+            payload,
+            event_type,
+            request.headers,
+            hermes_home=effective_profile_home,
         ):
             logger.info(
                 "[webhook] filtered event=%s route=%s",
@@ -661,15 +819,75 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # ── Atomic idempotency admission ─────────────────────────
+        # Every configured route-script side effect and downstream delivery is
+        # guarded by this reservation.  Filters remain before admission so an
+        # intentionally filtered event does not consume its provider ID.
+        provider, delivery_id = self._delivery_identity(request)
+        now = time.time()
+        reservation = self._reserve_delivery(
+            profile=effective_profile,
+            route=route_name,
+            provider=provider,
+            delivery_id=delivery_id,
+            now=now,
+        )
+        if reservation is None:
+            logger.info(
+                "[webhook] Skipping duplicate delivery provider=%s id=%s",
+                provider,
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
-            keep, transformed_payload = await asyncio.to_thread(
-                self._route_processor.run_route_script,
-                route_config.get("script"),
-                payload,
-            )
+            try:
+                script_result = await asyncio.to_thread(
+                    self._route_processor.run_route_script,
+                    route_config.get("script"),
+                    payload,
+                    hermes_home=effective_profile_home,
+                )
+            except Exception:
+                logger.exception(
+                    "[webhook] route-script execution failed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                self._release_delivery(reservation)
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Script execution failed",
+                        "route": route_name,
+                        "delivery_id": delivery_id,
+                    },
+                    status=503,
+                )
+            if len(script_result) == 2:
+                # Compatibility for injected/custom processors written against
+                # the historical two-tuple contract: an ignore is intentional.
+                keep, transformed_payload = script_result
+                retryable_script_failure = False
+            else:
+                keep, transformed_payload, retryable_script_failure = script_result
             if not keep:
+                if retryable_script_failure:
+                    self._release_delivery(reservation)
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error": "Script execution failed",
+                            "route": route_name,
+                            "delivery_id": delivery_id,
+                        },
+                        status=503,
+                    )
                 logger.info(
                     "[webhook] script ignored event=%s route=%s",
                     event_type,
@@ -719,27 +937,6 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
-        now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
-
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
         # deliver.  Use case: external services (Supabase, monitoring,
@@ -763,13 +960,19 @@ class WebhookAdapter(BasePlatformAdapter):
                 delivery_id,
             )
             try:
-                result = await self._direct_deliver(prompt, delivery)
+                result = await self._direct_deliver(
+                    prompt,
+                    delivery,
+                    profile=effective_profile,
+                    profile_is_primary=profile_is_primary,
+                )
             except Exception:
                 logger.exception(
                     "[webhook] direct-deliver failed route=%s delivery=%s",
                     route_name,
                     delivery_id,
                 )
+                self._release_delivery(reservation)
                 return web.json_response(
                     {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                     status=502,
@@ -793,14 +996,15 @@ class WebhookAdapter(BasePlatformAdapter):
                 delivery["deliver"],
                 result.error,
             )
+            self._release_delivery(reservation)
             return web.json_response(
                 {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # The reservation's tuple-scoped generation keeps concurrent and
+        # post-TTL retry runs independent (not queued/interrupted).
+        session_chat_id = reservation.session_chat_id
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -810,10 +1014,13 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "profile": effective_profile,
+            "profile_is_primary": profile_is_primary,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
+        self._active_delivery_sessions.add(session_chat_id)
         self._prune_delivery_info(now)
 
         # Build source and event
@@ -824,8 +1031,7 @@ class WebhookAdapter(BasePlatformAdapter):
             user_id=f"webhook:{route_name}",
             user_name=route_name,
         )
-        if profile and isinstance(profile, str):
-            source.profile = profile
+        source.profile = effective_profile
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -884,7 +1090,13 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        session_chat_id = event.source.chat_id
+        try:
+            await self._end_webhook_session(event, session_chat_id)
+        finally:
+            self._active_delivery_sessions.discard(session_chat_id)
+            self._delivery_info.pop(session_chat_id, None)
+            self._delivery_info_created.pop(session_chat_id, None)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
@@ -1182,7 +1394,12 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _direct_deliver(
-        self, content: str, delivery: dict
+        self,
+        content: str,
+        delivery: dict,
+        *,
+        profile: Optional[str] = None,
+        profile_is_primary: Optional[bool] = None,
     ) -> SendResult:
         """Deliver *content* directly without invoking the agent.
 
@@ -1206,7 +1423,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
-            deliver_type, content, delivery
+            deliver_type,
+            content,
+            delivery,
+            profile=profile,
+            profile_is_primary=profile_is_primary,
         )
 
     async def _deliver_github_comment(
@@ -1285,7 +1506,13 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
+        self,
+        platform_name: str,
+        content: str,
+        delivery: dict,
+        *,
+        profile: Optional[str] = None,
+        profile_is_primary: Optional[bool] = None,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1301,11 +1528,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 success=False, error=f"Unknown platform: {platform_name}"
             )
 
-        # Default adapters first; multiplex may park Slack/etc. only on a
-        # secondary profile (self._profile_adapters). Fall back so webhook
-        # deliver:slack still works when default has slack disabled.
-        adapter = self.gateway_runner.adapters.get(target_platform)
-        if not adapter:
+        # Resolve within the same effective profile as the inbound delivery.
+        # Calls with no profile retain the legacy cross-profile fallback.
+        adapter = None
+        if profile:
+            if profile_is_primary:
+                adapter = self.gateway_runner.adapters.get(target_platform)
+            else:
+                profile_adapters = (
+                    getattr(self.gateway_runner, "_profile_adapters", None) or {}
+                )
+                adapter = profile_adapters.get(profile, {}).get(target_platform)
+        else:
+            adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter and not profile:
             for _prof, amap in (getattr(self.gateway_runner, "_profile_adapters", None) or {}).items():
                 if not isinstance(amap, dict):
                     continue
@@ -1323,7 +1559,8 @@ class WebhookAdapter(BasePlatformAdapter):
         extra = delivery.get("deliver_extra", {})
         chat_id = extra.get("chat_id", "")
         if not chat_id:
-            home = self.gateway_runner.config.get_home_channel(target_platform)
+            target_config = getattr(adapter, "config", None)
+            home = getattr(target_config, "home_channel", None)
             if home:
                 chat_id = home.chat_id
             else:

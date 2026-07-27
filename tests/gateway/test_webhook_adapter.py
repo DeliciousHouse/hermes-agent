@@ -74,6 +74,7 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application(client_max_size=adapter._max_body_bytes)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post("/p/{profile}/webhooks/{route_name}", adapter._handle_webhook)
     return app
 
 
@@ -692,7 +693,10 @@ class TestPayloadFilters:
             }
 
         adapter.handle_message.assert_not_called()
-        assert "filter-skip-1" not in adapter._seen_deliveries
+        assert not any(
+            key[-1] == "filter-skip-1"
+            for key in adapter._delivery_reservations
+        )
 
     @pytest.mark.asyncio
     async def test_filter_accepts_nested_any_and_in_file(self, tmp_path, monkeypatch):
@@ -748,6 +752,54 @@ class TestPayloadFilters:
         await asyncio.sleep(0.05)
         assert len(captured) == 1
         assert captured[0].text == "Message from chat-2: hello"
+
+    @pytest.mark.asyncio
+    async def test_prefixed_profile_filter_file_uses_effective_profile_home(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import GatewayConfig
+
+        main_home = tmp_path / "profiles" / "main"
+        default_home = tmp_path / "default-home"
+        main_home.mkdir(parents=True)
+        default_home.mkdir(parents=True)
+        (main_home / "allow.txt").write_text("blocked\n", encoding="utf-8")
+        (default_home / "allow.txt").write_text("allowed\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(main_home))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "main"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("main", main_home), ("default", default_home)],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: {"main": main_home, "default": default_home}[name],
+        )
+        routes = {
+            "profiled": {
+                "secret": _INSECURE_NO_AUTH,
+                "filters": [{"field": "value", "in_file": "allow.txt"}],
+                "prompt": "accepted",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.gateway_runner = MagicMock(
+            config=GatewayConfig(multiplex_profiles=True)
+        )
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/p/default/webhooks/profiled",
+                json={"value": "allowed"},
+                headers={"X-GitHub-Delivery": "profile-filter-home"},
+            )
+
+        assert response.status == 202
+        adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_filter_applies_to_deliver_only_before_delivery(self):
@@ -864,8 +916,8 @@ class TestPayloadFilters:
         assert captured[0].text == "Task: profile-safe"
 
     @pytest.mark.asyncio
-    async def test_script_silent_stdout_ignores_without_idempotency_hit(self, tmp_path, monkeypatch):
-        """Empty or [SILENT] script stdout filters the webhook out."""
+    async def test_script_silent_stdout_ignores_and_consumes_id(self, tmp_path, monkeypatch):
+        """[SILENT] filters the webhook and consumes its delivery ID."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         scripts = tmp_path / "scripts"
         scripts.mkdir()
@@ -896,11 +948,14 @@ class TestPayloadFilters:
             }
 
         adapter.handle_message.assert_not_called()
-        assert "script-silent-1" not in adapter._seen_deliveries
+        assert any(
+            key[-1] == "script-silent-1"
+            for key in adapter._delivery_reservations
+        )
 
     @pytest.mark.asyncio
-    async def test_script_nonzero_exit_ignores_webhook(self, tmp_path, monkeypatch):
-        """A script can fail closed by exiting nonzero."""
+    async def test_script_nonzero_exit_ignores_and_consumes_id(self, tmp_path, monkeypatch):
+        """A nonzero script exit intentionally ignores and consumes the ID."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         scripts = tmp_path / "scripts"
         scripts.mkdir()
@@ -931,7 +986,10 @@ class TestPayloadFilters:
             assert data["reason"] == "script"
 
         adapter.handle_message.assert_not_called()
-        assert "script-nonzero-1" not in adapter._seen_deliveries
+        assert any(
+            key[-1] == "script-nonzero-1"
+            for key in adapter._delivery_reservations
+        )
 
 
 # ===================================================================
@@ -1039,6 +1097,41 @@ class TestHTTPHandling:
 class TestIdempotency:
 
     @pytest.mark.asyncio
+    async def test_concurrent_duplicate_is_reserved_before_route_script_runs(self):
+        """Only the owner of a delivery reservation may run route-side effects."""
+        routes = {
+            "idem": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "slow-transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        script_calls = 0
+
+        def _slow_script(_name, payload, *, hermes_home=None):
+            nonlocal script_calls
+            script_calls += 1
+            time.sleep(0.05)
+            return True, payload
+
+        adapter._route_processor.run_route_script = _slow_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "same-delivery"}
+            first, second = await asyncio.gather(
+                cli.post("/webhooks/idem", json={"a": 1}, headers=headers),
+                cli.post("/webhooks/idem", json={"a": 1}, headers=headers),
+            )
+            await asyncio.sleep(0)
+
+        assert sorted((first.status, second.status)) == [200, 202]
+        assert script_calls == 1
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_duplicate_delivery_id_returns_200(self):
         """Second request with same delivery ID returns 200 duplicate."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
@@ -1061,7 +1154,6 @@ class TestIdempotency:
         """After TTL expires, the same delivery ID is accepted again."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
         adapter = _make_adapter(routes=routes)
-        adapter._idempotency_ttl = 1  # 1 second TTL for test speed
         adapter.handle_message = AsyncMock()
 
         app = _create_app(adapter)
@@ -1071,11 +1163,88 @@ class TestIdempotency:
             resp1 = await cli.post("/webhooks/idem", json={"x": 1}, headers=headers)
             assert resp1.status == 202
 
-            # Backdate the cache entry so it appears expired
-            adapter._seen_deliveries["delivery-456"] = time.time() - 3700
-
+            adapter._idempotency_ttl = 0
             resp2 = await cli.post("/webhooks/idem", json={"x": 1}, headers=headers)
-            assert resp2.status == 202  # re-accepted
+            assert resp2.status == 202
+            await asyncio.sleep(0)
+
+        events = [call.args[0] for call in adapter.handle_message.await_args_list]
+        assert len(events) == 2
+        assert events[0].source.chat_id != events[1].source.chat_id
+
+    @pytest.mark.asyncio
+    async def test_expired_redelivery_keeps_each_running_generation_target(self):
+        """An old in-flight generation keeps its target after TTL re-admission."""
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "idem": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{generation}",
+                "deliver": "telegram",
+                "deliver_extra": {"chat_id": "{target}"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        target = AsyncMock()
+        target.send = AsyncMock(return_value=SendResult(success=True))
+        runner = MagicMock()
+        runner.config = GatewayConfig()
+        runner.adapters = {Platform.TELEGRAM: target}
+        adapter.gateway_runner = runner
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+            if event.raw_message["generation"] == "first":
+                first_started.set()
+                await release_first.wait()
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "same-provider-id"}
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/webhooks/idem",
+                json={"generation": "first", "target": "first-target"},
+                headers=headers,
+            )
+            assert first.status == 202
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+
+            adapter._idempotency_ttl = 0
+            second = await cli.post(
+                "/webhooks/idem",
+                json={"generation": "second", "target": "second-target"},
+                headers=headers,
+            )
+            assert second.status == 202
+            for _ in range(20):
+                if len(captured) == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert len(captured) == 2
+            first_chat = captured[0].source.chat_id
+            second_chat = captured[1].source.chat_id
+            assert first_chat != second_chat
+
+            assert (await adapter.send(first_chat, "first final")).success is True
+            assert (await adapter.send(second_chat, "second final")).success is True
+            assert [
+                (entry.args[0], entry.args[1])
+                for entry in target.send.await_args_list
+            ] == [
+                ("first-target", "first final"),
+                ("second-target", "second final"),
+            ]
+
+            release_first.set()
+            await asyncio.sleep(0)
 
     @pytest.mark.asyncio
     async def test_svix_id_used_as_delivery_id_for_deduplication(self):
@@ -1095,6 +1264,539 @@ class TestIdempotency:
             data = await resp2.json()
             assert data["status"] == "duplicate"
             assert data["delivery_id"] == "msg_duplicate"
+
+    @pytest.mark.asyncio
+    async def test_same_raw_id_isolated_by_route_and_provider(self):
+        routes = {
+            "one": {"secret": _INSECURE_NO_AUTH, "prompt": "one"},
+            "two": {"secret": _INSECURE_NO_AUTH, "prompt": "two"},
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            responses = [
+                await cli.post(
+                    "/webhooks/one", json={"x": 1},
+                    headers={"X-GitHub-Delivery": "shared"},
+                ),
+                await cli.post(
+                    "/webhooks/two", json={"x": 1},
+                    headers={"X-GitHub-Delivery": "shared"},
+                ),
+                await cli.post(
+                    "/webhooks/one", json={"x": 1},
+                    headers={"svix-id": "shared"},
+                ),
+            ]
+            await asyncio.sleep(0)
+
+        assert [response.status for response in responses] == [202, 202, 202]
+        assert adapter.handle_message.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_delimiter_like_components_do_not_collapse_session_keys(self):
+        routes = {
+            "a:b": {"secret": _INSECURE_NO_AUTH, "prompt": "one"},
+            "a": {"secret": _INSECURE_NO_AUTH, "prompt": "two"},
+        }
+        adapter = _make_adapter(routes=routes)
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/webhooks/a:b", json={"x": 1},
+                headers={"X-GitHub-Delivery": "c"},
+            )
+            second = await cli.post(
+                "/webhooks/a", json={"x": 1},
+                headers={"X-GitHub-Delivery": "b:c"},
+            )
+            await asyncio.sleep(0)
+
+        assert first.status == second.status == 202
+        assert captured[0].source.chat_id != captured[1].source.chat_id
+        assert len(adapter._delivery_reservations) == 2
+        assert len(adapter._delivery_info) == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_provider_id_uses_collision_resistant_fallbacks(self):
+        routes = {"fallback": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/fallback", json={"x": 1})
+            second = await cli.post("/webhooks/fallback", json={"x": 1})
+            await asyncio.sleep(0)
+            first_body = await first.json()
+            second_body = await second.json()
+
+        assert first.status == second.status == 202
+        assert first_body["delivery_id"] != second_body["delivery_id"]
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retryable_script_failure_releases_id_for_retry(self):
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[
+                (False, None, True),
+                (True, {"x": 1}, False),
+            ]
+        )
+
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "script-retry"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            second = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            await asyncio.sleep(0)
+
+        assert first.status == 503
+        assert second.status == 202
+        assert adapter._route_processor.run_route_script.call_count == 2
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_script_exception_releases_id_for_retry(self):
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[
+                RuntimeError("temporary setup failure"),
+                (True, {"x": 1}, False),
+            ]
+        )
+
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "script-exception-retry"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            second = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            await asyncio.sleep(0)
+
+        assert first.status == 503
+        assert second.status == 202
+        assert adapter._route_processor.run_route_script.call_count == 2
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_intentional_script_ignore_consumes_id(self):
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=(False, None, False)
+        )
+
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "script-ignore"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            second = await cli.post("/webhooks/scripted", json={"x": 1}, headers=headers)
+            first_body = await first.json()
+            second_body = await second.json()
+
+        assert first.status == second.status == 200
+        assert first_body["reason"] == "script"
+        assert second_body["status"] == "duplicate"
+        adapter._route_processor.run_route_script.assert_called_once()
+        adapter.handle_message.assert_not_awaited()
+
+    def test_old_generation_cannot_release_new_reservation(self):
+        adapter = _make_adapter()
+        first = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="same", now=100.0,
+        )
+        adapter._idempotency_ttl = 0
+        second = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="same", now=101.0,
+        )
+
+        assert first is not None and second is not None
+        adapter._release_delivery(first)
+        assert adapter._delivery_reservations[second.key] is second
+
+    def test_delivery_reservation_is_atomic_across_threads(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        adapter = _make_adapter()
+        workers = 16
+        barrier = Barrier(workers)
+
+        def _reserve(_index):
+            barrier.wait()
+            return adapter._reserve_delivery(
+                profile="default",
+                route="r",
+                provider="github",
+                delivery_id="same-threaded-delivery",
+                now=100.0,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            reservations = list(pool.map(_reserve, range(workers)))
+
+        assert sum(reservation is not None for reservation in reservations) == 1
+
+    def test_reservation_pruning_bounds_expired_entries_above_threshold(self):
+        adapter = _make_adapter()
+        adapter._idempotency_ttl = 10
+        for index in range(128):
+            assert adapter._reserve_delivery(
+                profile="default",
+                route="r",
+                provider="github",
+                delivery_id=f"expired-{index}",
+                now=0.0,
+            ) is not None
+
+        fresh = adapter._reserve_delivery(
+            profile="default",
+            route="r",
+            provider="github",
+            delivery_id="fresh",
+            now=100.0,
+        )
+
+        assert fresh is not None
+        assert adapter._delivery_reservations == {fresh.key: fresh}
+
+    @pytest.mark.asyncio
+    async def test_same_provider_id_isolated_by_effective_profile(self, monkeypatch):
+        from gateway.config import GatewayConfig
+
+        routes = {"r": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        runner = MagicMock()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        adapter.gateway_runner = runner
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("alpha", None), ("beta", None)],
+        )
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "shared-profile-id"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/p/alpha/webhooks/r", json={}, headers=headers)
+            second = await cli.post("/p/beta/webhooks/r", json={}, headers=headers)
+            await asyncio.sleep(0)
+
+        assert first.status == second.status == 202
+        assert {event.source.profile for event in captured} == {"alpha", "beta"}
+        assert len({event.source.chat_id for event in captured}) == 2
+
+    @pytest.mark.asyncio
+    async def test_named_main_and_default_are_distinct_profiles(self, monkeypatch, tmp_path):
+        """Unprefixed named-main traffic must not alias explicit default traffic."""
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{target}",
+                "script": "transform.py",
+                "deliver_extra": {"chat_id": "{target}"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        runner = MagicMock()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        adapter.gateway_runner = runner
+
+        main_home = tmp_path / "main-home"
+        default_home = tmp_path / "default-home"
+        main_home.mkdir()
+        default_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(main_home))
+        profile_homes = {"main": main_home, "default": default_home}
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: list(profile_homes.items()),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", profile_homes.__getitem__
+        )
+        active_profile = MagicMock(return_value="main")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", active_profile
+        )
+
+        seen_homes = []
+
+        def _script(_name, payload, *, hermes_home=None):
+            seen_homes.append(hermes_home)
+            return True, payload, False
+
+        adapter._route_processor.run_route_script = _script
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "shared-main-default-id"}
+
+        async with TestClient(TestServer(app)) as cli:
+            main_response = await cli.post(
+                "/webhooks/r", json={"target": "main-chat"}, headers=headers
+            )
+            default_response = await cli.post(
+                "/p/default/webhooks/r",
+                json={"target": "default-chat"},
+                headers=headers,
+            )
+            await asyncio.sleep(0)
+
+        assert main_response.status == default_response.status == 202
+        assert [event.source.profile for event in captured] == ["main", "default"]
+        assert seen_homes == [main_home, default_home]
+        assert active_profile.call_count == 2
+        assert {key[0] for key in adapter._delivery_reservations} == {
+            "main",
+            "default",
+        }
+        assert {
+            (info["profile"], info["deliver_extra"]["chat_id"])
+            for info in adapter._delivery_info.values()
+        } == {("main", "main-chat"), ("default", "default-chat")}
+
+    @pytest.mark.asyncio
+    async def test_custom_active_profile_uses_actual_hermes_home_for_script(
+        self, tmp_path, monkeypatch
+    ):
+        custom_home = tmp_path / "custom-home"
+        custom_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(custom_home))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "custom"
+        )
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "script": "transform.py",
+                "prompt": "ok",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        script_homes = []
+
+        def _script(_script, payload, *, hermes_home=None):
+            script_homes.append(hermes_home)
+            return True, payload, False
+
+        adapter._route_processor.run_route_script = MagicMock(side_effect=_script)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/scripted",
+                json={},
+                headers={"X-GitHub-Delivery": "custom-script-home"},
+            )
+
+        assert response.status == 202
+        assert script_homes == [custom_home]
+
+    @pytest.mark.asyncio
+    async def test_default_profile_aliases_share_one_dedupe_namespace(
+        self, monkeypatch, tmp_path
+    ):
+        """Default-host unprefixed and explicit-default URLs are aliases."""
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        runner = MagicMock()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        adapter.gateway_runner = runner
+
+        default_home = tmp_path / "default-home"
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", default_home)],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda profile: default_home
+        )
+        active_profile = MagicMock(return_value="default")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", active_profile
+        )
+
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=(True, {}, False)
+        )
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "shared-default-id"}
+
+        async with TestClient(TestServer(app)) as cli:
+            unprefixed = await cli.post("/webhooks/r", json={}, headers=headers)
+            explicit = await cli.post(
+                "/p/default/webhooks/r", json={}, headers=headers
+            )
+            explicit_body = await explicit.json()
+            await asyncio.sleep(0)
+
+        assert unprefixed.status == 202
+        assert explicit.status == 200
+        assert explicit_body["status"] == "duplicate"
+        assert active_profile.call_count == 2
+        adapter._route_processor.run_route_script.assert_called_once()
+        adapter.handle_message.assert_awaited_once()
+        assert {key[0] for key in adapter._delivery_reservations} == {"default"}
+        assert len(adapter._delivery_info) == 1
+
+    @pytest.mark.asyncio
+    async def test_effective_profile_drives_route_script_home(self, monkeypatch, tmp_path):
+        from gateway.config import GatewayConfig
+
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": "transform.py",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        runner = MagicMock()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        adapter.gateway_runner = runner
+        coder_home = tmp_path / "coder-home"
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("coder", coder_home)],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda profile: coder_home
+        )
+        active_profile = MagicMock(return_value="default")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", active_profile
+        )
+        seen_homes = []
+
+        def _script(_name, payload, *, hermes_home=None):
+            seen_homes.append(hermes_home)
+            return False, None, False
+
+        adapter._route_processor.run_route_script = _script
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/p/coder/webhooks/r",
+                json={},
+                headers={"X-GitHub-Delivery": "profile-script"},
+            )
+
+        assert response.status == 200
+        assert seen_homes == [coder_home]
+        active_profile.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_event_filter_does_not_consume_delivery_id(self):
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["push"],
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        delivery = {"X-GitHub-Delivery": "filtered-event"}
+
+        async with TestClient(TestServer(app)) as cli:
+            ignored = await cli.post(
+                "/webhooks/r",
+                json={},
+                headers={**delivery, "X-GitHub-Event": "issues"},
+            )
+            accepted = await cli.post(
+                "/webhooks/r",
+                json={},
+                headers={**delivery, "X-GitHub-Event": "push"},
+            )
+            await asyncio.sleep(0)
+
+        assert ignored.status == 200
+        assert accepted.status == 202
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_branch_filter_does_not_consume_delivery_id(self):
+        routes = {
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "branches": ["main"],
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "filtered-branch"}
+
+        async with TestClient(TestServer(app)) as cli:
+            ignored = await cli.post(
+                "/webhooks/r", json={"ref": "refs/heads/dev"}, headers=headers
+            )
+            accepted = await cli.post(
+                "/webhooks/r", json={"ref": "refs/heads/main"}, headers=headers
+            )
+            await asyncio.sleep(0)
+
+        assert ignored.status == 200
+        assert accepted.status == 202
+        adapter.handle_message.assert_awaited_once()
 
 
 # ===================================================================
@@ -1170,18 +1872,27 @@ class TestRateLimiting:
         """Expired delivery IDs can reprocess even when stale siblings remain."""
         adapter = _make_adapter(rate_limit=1)
         adapter._idempotency_ttl = 60
-        adapter._seen_deliveries = {
-            "expired-target": 100.0,
-            "expired-sibling": 101.0,
-            "fresh-sibling": 155.0,
-        }
+        target = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="expired-target", now=100.0,
+        )
+        sibling = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="expired-sibling", now=101.0,
+        )
+        fresh = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="fresh-sibling", now=155.0,
+        )
 
-        now = 200.0
-        assert adapter._record_delivery_id("expired-target", now) is True
+        renewed = adapter._reserve_delivery(
+            profile="default", route="r", provider="github",
+            delivery_id="expired-target", now=200.0,
+        )
 
-        assert adapter._seen_deliveries["expired-target"] == now
-        assert "expired-sibling" in adapter._seen_deliveries
-        assert "fresh-sibling" in adapter._seen_deliveries
+        assert renewed is not None and renewed is not target
+        assert sibling is not None and sibling.key in adapter._delivery_reservations
+        assert fresh is not None and fresh.key in adapter._delivery_reservations
 
 
 # ===================================================================
@@ -1378,6 +2089,44 @@ class TestDeliveryCleanup:
             (now - 5, "webhook:test:new"),
             (now, "webhook:test:newer"),
         ]
+
+    @pytest.mark.asyncio
+    async def test_active_delivery_metadata_survives_ttl_then_cleans_on_completion(self):
+        """TTL cleanup skips active sessions without retaining stale siblings."""
+        adapter = _make_adapter()
+        adapter._idempotency_ttl = 60
+        now = 1000.0
+        active = "webhook:test:active"
+        stale = "webhook:test:stale"
+        fresh = "webhook:test:fresh"
+
+        for key, created_at in (
+            (active, now - 180),
+            (stale, now - 120),
+            (fresh, now - 5),
+        ):
+            adapter._delivery_info[key] = {"deliver": "log"}
+            adapter._delivery_info_created[key] = created_at
+            adapter._delivery_info_order.append((created_at, key))
+        adapter._active_delivery_sessions.add(active)
+
+        adapter._prune_delivery_info(now)
+
+        assert active in adapter._delivery_info
+        assert stale not in adapter._delivery_info
+        assert fresh in adapter._delivery_info
+        assert list(adapter._delivery_info_order) == [
+            (now - 180, active),
+            (now - 5, fresh),
+        ]
+
+        event = MagicMock()
+        event.source.chat_id = active
+        await adapter.on_processing_complete(event, outcome=None)
+
+        assert active not in adapter._active_delivery_sessions
+        assert active not in adapter._delivery_info
+        assert active not in adapter._delivery_info_created
 
 
 # ===================================================================

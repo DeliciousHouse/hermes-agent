@@ -79,6 +79,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | Property | Required | Description |
 |----------|----------|-------------|
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` in the payload. |
+| `branches` | No | List of target branches to accept. Branches are read from push `ref`, pull-request base refs, or GitLab target-branch fields. Non-matches are ignored before idempotency admission. |
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
@@ -162,7 +163,7 @@ Field paths use dot notation. `payload.foo` reads from a top-level `payload` obj
 
 ### Script Filters and Transforms
 
-Use `script` when declarative filters are not enough. Scripts must live under `~/.hermes/scripts/` for the active profile; relative paths resolve there, and path traversal outside that directory is blocked. `.sh` and `.bash` scripts run with bash, and all other extensions run with the current Python interpreter.
+Use `script` when declarative filters are not enough. Scripts must live under `~/.hermes/scripts/` for the request's effective profile; relative paths resolve there, and path traversal outside that directory is blocked. `.sh` and `.bash` scripts run with bash, and all other extensions run with the current Python interpreter.
 
 The route payload is sent to stdin as JSON:
 
@@ -185,7 +186,8 @@ Script outcomes:
 
 - JSON object stdout replaces the payload used by `prompt` and `deliver_extra`.
 - Non-JSON text stdout is added to the payload as `script_output`.
-- Empty stdout, exact `[SILENT]`, `{"__hermes_ignore__": true}`, timeout, missing script, or nonzero exit code returns HTTP 200 with `{"status":"ignored","reason":"script"}`.
+- Empty stdout, exact `[SILENT]`, `{"__hermes_ignore__": true}`, or a nonzero exit code intentionally consumes the delivery ID and returns HTTP 200 with `{"status":"ignored","reason":"script"}`.
+- Operational failures such as a missing script, missing interpreter, timeout, or execution exception release the delivery reservation and return HTTP 503 so the provider can retry.
 
 ### Prompt Templates
 
@@ -378,20 +380,21 @@ hermes webhook subscribe antenna-matches \
 | Status | Meaning |
 |--------|---------|
 | `200 OK` | Delivered successfully. Body: `{"status": "delivered", "route": "...", "target": "...", "delivery_id": "..."}` |
-| `200 OK` (status=duplicate) | Duplicate `X-GitHub-Delivery` ID within the idempotency TTL (1 hour). Not re-delivered. |
+| `200 OK` (status=duplicate) | Duplicate provider delivery ID within the idempotency TTL (1 hour). Not re-delivered. |
 | `401 Unauthorized` | HMAC signature invalid or missing. |
 | `400 Bad Request` | Malformed JSON body. |
 | `404 Not Found` | Unknown route name. |
 | `413 Payload Too Large` | Body exceeded `max_body_bytes`. |
 | `429 Too Many Requests` | Route rate limit exceeded. |
 | `502 Bad Gateway` | Target adapter rejected the message or raised. The error is logged server-side; the response body is a generic `Delivery failed` to avoid leaking adapter internals. |
+| `503 Service Unavailable` | A configured route script could not be started or timed out. The reservation is released so the provider can retry the delivery. |
 
 ### Configuration gotchas
 
 - `deliver_only: true` requires `deliver` to be a real target. `deliver: log` (or omitting `deliver`) is rejected at startup — the adapter refuses to start if it finds a misconfigured route.
 - The `skills` field is ignored in direct delivery mode (no agent runs, so there's nothing to inject skills into).
 - Template rendering uses the same `{dot.notation}` syntax as agent mode, including the `{__raw__}` token.
-- Idempotency uses the same `X-GitHub-Delivery` / `X-Request-ID` header — retries with the same ID return `status=duplicate` and do NOT re-deliver.
+- Idempotency reuses `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` when present. The full namespace is `(effective profile, route, provider, delivery ID)`, so retries in one profile or route cannot suppress another. Requests without one of these headers receive a collision-resistant generated ID. Retries with the same full identity return `status=duplicate` and do NOT re-deliver.
 
 ---
 
@@ -481,7 +484,18 @@ Requests exceeding the limit receive a `429 Too Many Requests` response.
 
 ### Idempotency
 
-Delivery IDs (from `X-GitHub-Delivery`, `X-Request-ID`, or a timestamp fallback) are cached for **1 hour**. Duplicate deliveries (e.g. webhook retries) are silently skipped with a `200` response, preventing duplicate agent runs.
+Delivery IDs from `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` are cached for **1 hour**. Requests without one of these headers receive a collision-resistant generated ID. Duplicate deliveries (e.g. webhook retries) are silently skipped with a `200` response, preventing duplicate agent runs and duplicate route-script side effects.
+
+The cache is scoped by effective profile, route, provider, and raw delivery ID, so two providers, routes, or profiles may safely use the same raw ID. Configure the TTL globally:
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      idempotency_ttl_seconds: 3600
+```
+
+Operational route-script or direct-delivery failures release the current reservation for retry. Intentional script ignores consume it. A retry accepted after the TTL receives a new internal session generation, so it cannot collide with the prior run.
 
 ### Body size limits
 
@@ -540,8 +554,8 @@ This is the same trust model that applies to everything the agent reads: web pag
 
 ### Duplicate responses
 
-- The idempotency cache should prevent this — check that the webhook source is sending a delivery ID header (`X-GitHub-Delivery` or `X-Request-ID`)
-- Delivery IDs are cached for 1 hour
+- The idempotency cache should prevent this — check that the webhook source is sending a delivery ID header (`X-GitHub-Delivery`, `svix-id`, or `X-Request-ID`)
+- Delivery IDs are cached for 1 hour by default; check `platforms.webhook.extra.idempotency_ttl_seconds`
 
 ### `gh` CLI errors (GitHub comment delivery)
 

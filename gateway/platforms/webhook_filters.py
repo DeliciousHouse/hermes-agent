@@ -26,16 +26,19 @@ def _stringify_filter_value(value: Any) -> str:
     return str(value)
 
 
-def _resolve_profile_path(path_value: Any) -> Optional[Path]:
+def _resolve_profile_path(
+    path_value: Any, *, hermes_home: Optional[Path] = None
+) -> Optional[Path]:
     """Resolve a user path, mapping ~/.hermes to the active profile home."""
     if not isinstance(path_value, str):
         return None
     raw = os.path.expandvars(path_value.strip())
     if not raw:
         return None
-    from hermes_constants import get_hermes_home
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
 
-    hermes_home = get_hermes_home()
+        hermes_home = get_hermes_home()
     if raw == "~/.hermes":
         return hermes_home
     if raw.startswith("~/.hermes/"):
@@ -46,16 +49,20 @@ def _resolve_profile_path(path_value: Any) -> Optional[Path]:
     return hermes_home / path
 
 
-def _resolve_script_path(script_value: Any) -> tuple[Optional[Path], Optional[str]]:
+def _resolve_script_path(
+    script_value: Any, *, hermes_home: Optional[Path] = None
+) -> tuple[Optional[Path], Optional[str]]:
     """Resolve a route script under HERMES_HOME/scripts."""
     if not isinstance(script_value, str) or not script_value.strip():
         return None, "script path is empty"
-    from hermes_constants import get_hermes_home
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
 
-    scripts_root = (get_hermes_home() / "scripts").resolve()
+        hermes_home = get_hermes_home()
+    scripts_root = (hermes_home / "scripts").resolve()
     raw_text = os.path.expandvars(script_value.strip())
     if raw_text == "~/.hermes" or raw_text.startswith("~/.hermes/"):
-        mapped = _resolve_profile_path(raw_text)
+        mapped = _resolve_profile_path(raw_text, hermes_home=hermes_home)
         candidate = mapped.resolve() if mapped is not None else scripts_root
     else:
         raw = Path(raw_text).expanduser()
@@ -71,8 +78,10 @@ def _resolve_script_path(script_value: Any) -> tuple[Optional[Path], Optional[st
     return candidate, None
 
 
-def _load_filter_file_values(path_value: Any) -> list[Any]:
-    path = _resolve_profile_path(path_value)
+def _load_filter_file_values(
+    path_value: Any, *, hermes_home: Optional[Path] = None
+) -> list[Any]:
+    path = _resolve_profile_path(path_value, hermes_home=hermes_home)
     if path is None:
         return []
     try:
@@ -144,6 +153,8 @@ class WebhookRouteProcessor:
         payload: dict,
         event_type: str,
         headers: Any,
+        *,
+        hermes_home: Optional[Path] = None,
     ) -> bool:
         """Evaluate one declarative webhook filter spec."""
         if not isinstance(spec, dict):
@@ -153,17 +164,35 @@ class WebhookRouteProcessor:
         if "all" in spec:
             items = spec.get("all")
             return isinstance(items, list) and all(
-                self.filter_matches(item, payload, event_type, headers)
+                self.filter_matches(
+                    item,
+                    payload,
+                    event_type,
+                    headers,
+                    hermes_home=hermes_home,
+                )
                 for item in items
             )
         if "any" in spec:
             items = spec.get("any")
             return isinstance(items, list) and any(
-                self.filter_matches(item, payload, event_type, headers)
+                self.filter_matches(
+                    item,
+                    payload,
+                    event_type,
+                    headers,
+                    hermes_home=hermes_home,
+                )
                 for item in items
             )
         if "not" in spec:
-            return not self.filter_matches(spec.get("not"), payload, event_type, headers)
+            return not self.filter_matches(
+                spec.get("not"),
+                payload,
+                event_type,
+                headers,
+                hermes_home=hermes_home,
+            )
 
         value = self.resolve_filter_field(
             spec.get("field"), payload, event_type, headers
@@ -189,7 +218,9 @@ class WebhookRouteProcessor:
             haystack = spec.get("in")
             return isinstance(haystack, list) and value in haystack
         if "in_file" in spec:
-            return value in _load_filter_file_values(spec.get("in_file"))
+            return value in _load_filter_file_values(
+                spec.get("in_file"), hermes_home=hermes_home
+            )
         if "regex" in spec:
             if value is _MISSING:
                 return False
@@ -211,26 +242,46 @@ class WebhookRouteProcessor:
         payload: dict,
         event_type: str,
         headers: Any,
+        *,
+        hermes_home: Optional[Path] = None,
     ) -> bool:
         filters = route_config.get("filters") or []
         if not filters:
             return True
         if isinstance(filters, dict):
-            return self.filter_matches(filters, payload, event_type, headers)
+            return self.filter_matches(
+                filters,
+                payload,
+                event_type,
+                headers,
+                hermes_home=hermes_home,
+            )
         if not isinstance(filters, list):
             logger.warning("[webhook] filters must be a list or object")
             return False
         return all(
-            self.filter_matches(spec, payload, event_type, headers)
+            self.filter_matches(
+                spec,
+                payload,
+                event_type,
+                headers,
+                hermes_home=hermes_home,
+            )
             for spec in filters
         )
 
-    def run_route_script(self, script_value: Any, payload: dict) -> tuple[bool, Optional[dict]]:
-        """Run a route script and return (should_continue, transformed_payload)."""
-        path, error = _resolve_script_path(script_value)
+    def run_route_script(
+        self,
+        script_value: Any,
+        payload: dict,
+        *,
+        hermes_home: Optional[Path] = None,
+    ) -> tuple[bool, Optional[dict], bool]:
+        """Return ``(continue, payload, retryable_failure)`` for a route script."""
+        path, error = _resolve_script_path(script_value, hermes_home=hermes_home)
         if error or path is None:
             logger.warning("[webhook] script ignored webhook: %s", error)
-            return False, None
+            return False, None, True
 
         suffix = path.suffix.lower()
         if suffix in {".sh", ".bash"}:
@@ -239,7 +290,7 @@ class WebhookRouteProcessor:
             )
             if bash is None:
                 logger.warning("[webhook] script ignored webhook: bash not found")
-                return False, None
+                return False, None, True
             argv = [bash, str(path)]
         else:
             argv = [sys.executable, str(path)]
@@ -260,10 +311,10 @@ class WebhookRouteProcessor:
             )
         except subprocess.TimeoutExpired:
             logger.warning("[webhook] script timed out: %s", path)
-            return False, None
+            return False, None, True
         except Exception as exc:
             logger.warning("[webhook] script execution failed: %s", exc)
-            return False, None
+            return False, None, True
 
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -283,9 +334,9 @@ class WebhookRouteProcessor:
                 result.returncode,
                 stderr[:200],
             )
-            return False, None
+            return False, None, False
         if not stdout or stdout == "[SILENT]":
-            return False, None
+            return False, None, False
 
         try:
             transformed = json.loads(stdout)
@@ -293,10 +344,10 @@ class WebhookRouteProcessor:
             transformed = {**payload, "script_output": stdout}
         if not isinstance(transformed, dict):
             logger.warning("[webhook] script stdout must be a JSON object or text")
-            return False, None
+            return False, None, False
         if (
             transformed.get("[SILENT]") is True
             or transformed.get("__hermes_ignore__") is True
         ):
-            return False, None
-        return True, transformed
+            return False, None, False
+        return True, transformed, False
