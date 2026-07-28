@@ -1,13 +1,55 @@
+from types import SimpleNamespace
 from unittest.mock import patch
+
+
+def test_node_satisfies_build_enforces_repository_major_baseline():
+    from hermes_cli.dep_ensure import node_satisfies_build
+
+    assert node_satisfies_build("v23.11.0") is False
+    assert node_satisfies_build("v24.0.0") is True
+    assert node_satisfies_build("25.1.0") is True
+    assert node_satisfies_build("not-a-version") is False
 
 
 def test_ensure_dependency_skips_when_present():
     """ensure_dependency is a no-op when the dep is already available."""
     from hermes_cli.dep_ensure import ensure_dependency
-    with patch("hermes_cli.dep_ensure.shutil") as mock_shutil:
+    with (
+        patch("hermes_cli.dep_ensure.shutil") as mock_shutil,
+        patch("hermes_cli.dep_ensure.subprocess.run") as mock_run,
+    ):
         mock_shutil.which.return_value = "/usr/bin/node"
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="v24.0.0")
         result = ensure_dependency("node", interactive=False)
         assert result is True
+
+
+def test_ensure_dependency_replaces_node_below_repository_baseline(tmp_path):
+    from hermes_cli.dep_ensure import ensure_dependency
+
+    script = tmp_path / "install.sh"
+    script.write_text("#!/bin/bash", encoding="utf-8")
+    installer_calls = []
+    versions = iter(("v23.11.0", "v24.0.0"))
+
+    def fake_run(command, **_kwargs):
+        if command[1:] == ["--version"]:
+            return SimpleNamespace(returncode=0, stdout=next(versions))
+        installer_calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    with (
+        patch("hermes_cli.dep_ensure.shutil.which", return_value="/usr/bin/node"),
+        patch("hermes_cli.dep_ensure.subprocess.run", side_effect=fake_run),
+        patch(
+            "hermes_cli.dep_ensure._find_install_script",
+            return_value=(script, "bash"),
+        ),
+    ):
+        assert ensure_dependency("node", interactive=False) is True
+
+    assert installer_calls
+    assert installer_calls[0][-2:] == ["--ensure", "node"]
 
 
 def test_ensure_dependency_returns_false_when_missing_noninteractive():

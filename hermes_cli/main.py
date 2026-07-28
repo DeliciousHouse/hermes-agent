@@ -1575,7 +1575,8 @@ def _ensure_tui_node() -> None:
     Idempotent no-op when node+npm are already discoverable. Set
     ``HERMES_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
     """
-    if shutil.which("node") and shutil.which("npm"):
+    node = shutil.which("node")
+    if node and shutil.which("npm") and _node_is_supported(node):
         return
     if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
@@ -1621,6 +1622,13 @@ def _ensure_tui_node() -> None:
     os.environ["PATH"] = os.pathsep.join(parts)
 
 
+def _node_is_supported(node_path: str | None = None) -> bool:
+    """Lazy bridge to the shared repository Node baseline check."""
+    from hermes_cli.dep_ensure import node_is_supported
+
+    return node_is_supported(node_path)
+
+
 def _find_bundled_tui(hermes_cli_dir: Path | None = None) -> Path | None:
     """Find a pre-built TUI entry.js bundled in the wheel."""
     if hermes_cli_dir is None:
@@ -1636,18 +1644,33 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     def _node_bin(bin: str) -> str:
         if bin == "node":
             env_node = os.environ.get("HERMES_NODE")
-            if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
+            if (
+                env_node
+                and os.path.isfile(env_node)
+                and os.access(env_node, os.X_OK)
+                and _node_is_supported(env_node)
+            ):
                 return env_node
         path = shutil.which(bin)
+        if bin == "node" and path and not _node_is_supported(path):
+            path = None
         if not path and bin == "node":
             try:
                 from hermes_cli.dep_ensure import ensure_dependency
                 if ensure_dependency("node"):
                     path = shutil.which("node")
+                    if path and not _node_is_supported(path):
+                        path = None
             except Exception:
                 pass
         if not path:
-            print(f"{bin} not found — install Node.js to use the TUI.")
+            if bin == "node":
+                print(
+                    "Node.js 24+ not found — install a supported Node.js runtime "
+                    "to use the TUI."
+                )
+            else:
+                print(f"{bin} not found — install Node.js to use the TUI.")
             sys.exit(1)
         return path
 
@@ -1662,18 +1685,18 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         )
         sys.exit(1)
 
+    node = _node_bin("node")
+
     # 1. Prebuilt bundle (nix / packaged release): just run it.
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
             if (p / "dist" / "entry.js").is_file():
-                node = _node_bin("node")
                 return [node, "--expose-gc", str(p / "dist" / "entry.js")], p
 
         # 1b. Bundled in wheel (pip install)
         bundled = _find_bundled_tui()
         if bundled is not None:
-            node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
 
     # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
@@ -1791,7 +1814,6 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
 
-    node = _node_bin("node")
     return [node, "--expose-gc", str(tui_dir / "dist" / "entry.js")], tui_dir
 
 

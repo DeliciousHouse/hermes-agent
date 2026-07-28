@@ -21,11 +21,42 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-
 _IS_WINDOWS = platform.system() == "Windows"
+NODE_MIN_MAJOR = 24
+
+
+def node_satisfies_build(version: str) -> bool:
+    """Return whether a Node version satisfies the repository baseline."""
+    normalized = version.strip().removeprefix("v").split("-", 1)[0]
+    try:
+        major = int(normalized.split(".", 1)[0])
+    except (TypeError, ValueError):
+        return False
+    return major >= NODE_MIN_MAJOR
+
+
+def node_is_supported(node_path: str | None = None) -> bool:
+    """Check that the selected Node executable exists and meets the baseline."""
+    candidate = node_path or shutil.which("node")
+    if not candidate:
+        return False
+    try:
+        result = subprocess.run(
+            [candidate, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and node_satisfies_build(result.stdout)
+
 
 _DEP_CHECKS = {
-    "node": lambda: shutil.which("node") is not None,
+    "node": node_is_supported,
     "browser": lambda: (
         shutil.which("agent-browser") is not None
         or _has_system_browser()

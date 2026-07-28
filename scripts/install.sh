@@ -57,7 +57,7 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
-NODE_VERSION="22"
+NODE_VERSION="24"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -702,21 +702,15 @@ check_git() {
     exit 1
 }
 
-# The desktop build runs Vite ^8, which refuses to start on Node outside
-# `^20.19 || >=22.12` — older Node lacks `node:util.styleText`, so `vite build`
-# crashes with a SyntaxError that surfaces only as the opaque "Build desktop
-# app … exit code 1" install failure. Returns 0 when the given `node --version`
-# string clears that floor; anything below it is replaced with the Hermes-
-# managed Node $NODE_VERSION LTS.
+# The root workspace declares Node >=$NODE_VERSION. Keep the installer on that
+# same baseline so every npm path (browser tools, TUI, and desktop builds) runs
+# with a supported runtime instead of merely clearing an individual package's
+# lower compatibility floor.
 node_satisfies_build() {
     local ver="${1#v}"
     local major="${ver%%.*}"
-    local minor="${ver#*.}"; minor="${minor%%.*}"
     case "$major" in ''|*[!0-9]*) return 1 ;; esac
-    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    if [ "$major" -eq 20 ] && [ "$minor" -ge 19 ]; then return 0; fi
-    if [ "$major" -ge 22 ] && { [ "$major" -gt 22 ] || [ "$minor" -ge 12 ]; }; then return 0; fi
-    return 1
+    [ "$major" -ge "$NODE_VERSION" ]
 }
 
 check_node() {
@@ -737,7 +731,7 @@ check_node() {
     fi
 
     if command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old for the desktop build (need ^20.19 or >=22.12) — installing Hermes-managed Node $NODE_VERSION LTS..."
+        log_warn "Node.js $(node --version) is below the repository baseline (need >=$NODE_VERSION) — installing Hermes-managed Node $NODE_VERSION LTS..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
@@ -752,8 +746,13 @@ install_node() {
         if pkg install -y nodejs >/dev/null; then
             local installed_ver
             installed_ver=$(node --version 2>/dev/null)
-            log_success "Node.js $installed_ver installed via pkg"
-            HAS_NODE=true
+            if node_satisfies_build "$installed_ver"; then
+                log_success "Node.js $installed_ver installed via pkg"
+                HAS_NODE=true
+            else
+                log_warn "Termux installed Node.js $installed_ver, below the required >=$NODE_VERSION baseline"
+                HAS_NODE=false
+            fi
         else
             log_warn "Failed to install Node.js via pkg"
             HAS_NODE=false
@@ -786,7 +785,7 @@ install_node() {
             ;;
     esac
 
-    # Resolve the latest v22.x.x tarball name from the index page
+    # Resolve the latest v$NODE_VERSION.x.x tarball name from the index page
     local index_url="https://nodejs.org/dist/latest-v${NODE_VERSION}.x/"
     local tarball_name
     tarball_name=$(curl -fsSL "$index_url" \
@@ -855,6 +854,12 @@ install_node() {
 
     local installed_ver
     installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
+    if ! node_satisfies_build "$installed_ver"; then
+        log_warn "Hermes-managed Node.js $installed_ver is below the required >=$NODE_VERSION baseline"
+        log_info "Install Node.js $NODE_VERSION+ manually: https://nodejs.org/en/download/"
+        HAS_NODE=false
+        return 0
+    fi
     log_success "Node.js $installed_ver installed to ~/.hermes/node/"
     HAS_NODE=true
 }
@@ -2395,14 +2400,19 @@ install_desktop() {
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
     # Always re-resolve Node here. Stages run in separate processes, so we can't
-    # trust an earlier check; more importantly check_node now enforces the build
-    # floor (^20.19 || >=22.12) and prepends the Hermes-managed Node to PATH, so
+    # trust an earlier check; more importantly check_node now enforces the root
+    # Node >=$NODE_VERSION baseline and prepends the managed Node to PATH, so
     # the build never runs on a too-old system Node — the cause of the opaque
     # "Build desktop app … exit code 1" failure (Vite crashes on old Node).
     check_node
+    if [ "$HAS_NODE" != true ]; then
+        log_error "Cannot build desktop app: Node.js $NODE_VERSION+ unavailable after automatic installation"
+        log_info "Install Node.js $NODE_VERSION+ and retry: cd $desktop_dir && npm run pack"
+        return 1
+    fi
     if ! command -v npm >/dev/null 2>&1; then
-        log_error "Cannot build desktop app: Node.js / npm unavailable"
-        log_info "Install Node.js and retry: cd $desktop_dir && npm run pack"
+        log_error "Cannot build desktop app: npm unavailable for Node.js $NODE_VERSION+"
+        log_info "Repair the Node.js installation and retry: cd $desktop_dir && npm run pack"
         return 1
     fi
     if [ ! -f "$desktop_dir/package.json" ]; then
