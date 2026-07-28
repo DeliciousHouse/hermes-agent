@@ -8,9 +8,10 @@ import pytest
 
 
 @pytest.fixture
-def main_mod():
+def main_mod(monkeypatch):
     import hermes_cli.main as m
 
+    monkeypatch.setattr(m, "_node_is_supported", lambda _path=None: True)
     return m
 
 

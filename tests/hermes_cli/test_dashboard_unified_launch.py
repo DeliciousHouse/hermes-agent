@@ -16,6 +16,14 @@ def main_mod():
     return main_mod
 
 
+@pytest.fixture(autouse=True)
+def _supported_node(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.main._node_is_supported",
+        lambda _path=None: True,
+    )
+
+
 def _args(**kw):
     defaults = dict(
         status=False, stop=False, host="127.0.0.1", port=9119,

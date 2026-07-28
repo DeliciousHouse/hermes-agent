@@ -110,3 +110,23 @@ def test_setup_hint_uses_gateway_service_command(monkeypatch: pytest.MonkeyPatch
     out = capsys.readouterr().out
     assert "Start the gateway:  hermes gateway start" in out
     assert "--platform photon" not in out
+
+
+def test_install_sidecar_rejects_node_below_repository_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(cli, "resolve_supported_node", lambda _path=None: None)
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("npm must not run on an unsupported Node runtime")
+
+    monkeypatch.setattr(cli.subprocess, "run", unexpected_run)
+
+    assert cli._install_sidecar() == 1
+    assert "Node.js 24+" in capsys.readouterr().err

@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from hermes_cli.colors import Colors, color
+from hermes_cli.dep_ensure import resolve_supported_node
 
 from . import auth as photon_auth
 
@@ -311,9 +312,9 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     # callback is the only sink that sees credential-derived strings, so
     # cli.py keeps zero taint flow according to CodeQL.
     photon_auth.print_credential_summary(print)
-    node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node")
+    node_bin = resolve_supported_node(os.getenv("PHOTON_NODE_BIN"))
     sidecar_installed = (_SIDECAR_DIR / "node_modules").exists()
-    print(f"  node binary         : {node_bin or '✗ missing (install Node 18+)'}")
+    print(f"  node binary         : {node_bin or '✗ missing (install Node 24+)'}")
     print(f"  sidecar deps        : {'✓ installed' if sidecar_installed else '✗ run `hermes photon install-sidecar`'}")
     print(f"  telemetry           : {'on' if _telemetry_enabled() else 'off'} (`hermes photon telemetry on|off`)")
     return 0
@@ -368,10 +369,18 @@ def _cmd_telemetry(args: argparse.Namespace) -> int:
 
 
 def _install_sidecar() -> int:
+    node_bin = resolve_supported_node(os.getenv("PHOTON_NODE_BIN"))
+    if not node_bin:
+        print(
+            "Node.js 24+ is required for the Photon sidecar. "
+            "Install a supported runtime and re-run.",
+            file=sys.stderr,
+        )
+        return 1
     npm = shutil.which("npm") or "npm"
     if not shutil.which(npm):
         print(
-            "npm is not on PATH. Install Node.js 18+ (https://nodejs.org/) "
+            "npm is not on PATH. Install Node.js 24+ (https://nodejs.org/) "
             "and re-run.",
             file=sys.stderr,
         )

@@ -13,6 +13,11 @@ import pytest
 from hermes_cli import main as cli_main
 
 
+@pytest.fixture(autouse=True)
+def _supported_node(monkeypatch):
+    monkeypatch.setattr(cli_main, "_node_is_supported", lambda _path=None: True)
+
+
 def _ns(**kw):
     defaults = dict(
         skip_build=False,

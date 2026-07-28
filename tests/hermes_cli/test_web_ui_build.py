@@ -11,8 +11,17 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from hermes_cli.main import _web_ui_build_needed, _build_web_ui, _run_npm_install_deterministic
+
+
+@pytest.fixture(autouse=True)
+def _supported_node(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.main._node_is_supported",
+        lambda _path=None: True,
+    )
 
 
 def _touch(path: Path, offset: float = 0.0) -> None:

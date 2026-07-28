@@ -22,10 +22,85 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 _IS_WINDOWS = platform.system() == "Windows"
+NODE_MIN_MAJOR = 24
+
+
+def _get_hermes_home() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
+
+
+def node_satisfies_build(version: str) -> bool:
+    """Return whether a Node version satisfies the repository baseline."""
+    try:
+        normalized = version.strip().removeprefix("v").split("-", 1)[0]
+        major = int(normalized.split(".", 1)[0])
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return major >= NODE_MIN_MAJOR
+
+
+def _managed_node_path() -> Path:
+    home = _get_hermes_home()
+    if _IS_WINDOWS:
+        return home / "node" / "node.exe"
+    return home / "node" / "bin" / "node"
+
+
+def _promote_node_directory(node_path: str) -> None:
+    """Expose npm/npx installed beside a selected Node to this process."""
+    node_dir = str(Path(node_path).expanduser().parent)
+    parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    if node_dir in parts:
+        return
+    os.environ["PATH"] = os.pathsep.join([node_dir, *parts])
+
+
+def resolve_supported_node(node_path: str | None = None) -> str | None:
+    """Resolve Node >= the repository baseline, including Hermes-managed installs."""
+    if node_path:
+        candidates = [node_path]
+    else:
+        managed_node = _managed_node_path()
+        candidates = [
+            os.environ.get("HERMES_NODE"),
+            shutil.which("node"),
+            str(managed_node) if managed_node.is_file() else None,
+        ]
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            result = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0 and node_satisfies_build(result.stdout):
+            _promote_node_directory(candidate)
+            return candidate
+    return None
+
+
+def node_is_supported(node_path: str | None = None) -> bool:
+    """Check that a supported Node executable is available."""
+    return resolve_supported_node(node_path) is not None
+
 
 _DEP_CHECKS = {
-    "node": lambda: shutil.which("node") is not None,
+    "node": node_is_supported,
     "browser": lambda: (
         shutil.which("agent-browser") is not None
         or _has_system_browser()
@@ -55,8 +130,7 @@ def _has_system_browser() -> bool:
 
 
 def _has_hermes_agent_browser() -> bool:
-    from hermes_constants import get_hermes_home
-    home = get_hermes_home()
+    home = _get_hermes_home()
     if _IS_WINDOWS:
         # npm -g --prefix puts .cmd shims directly in the prefix dir on Windows
         return (home / "node" / "agent-browser.cmd").is_file()
@@ -130,7 +204,6 @@ def ensure_dependency(
             return False
 
     if shell == "powershell":
-        from hermes_constants import get_hermes_home
         ps_bin = shutil.which("powershell") or shutil.which("pwsh")
         if not ps_bin:
             if interactive:
@@ -141,7 +214,7 @@ def ensure_dependency(
             "-ExecutionPolicy", "Bypass",
             "-File", str(script),
             "-Ensure", dep,
-            "-HermesHome", str(get_hermes_home()),
+            "-HermesHome", str(_get_hermes_home()),
         ]
     else:
         cmd = ["bash", str(script), "--ensure", dep]

@@ -1575,7 +1575,8 @@ def _ensure_tui_node() -> None:
     Idempotent no-op when node+npm are already discoverable. Set
     ``HERMES_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
     """
-    if shutil.which("node") and shutil.which("npm"):
+    node = shutil.which("node")
+    if node and shutil.which("npm") and _node_is_supported(node):
         return
     if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
@@ -1621,6 +1622,67 @@ def _ensure_tui_node() -> None:
     os.environ["PATH"] = os.pathsep.join(parts)
 
 
+def _node_is_supported(node_path: str | None = None) -> bool:
+    """Lazy bridge to the shared repository Node baseline check."""
+    from hermes_cli.dep_ensure import node_is_supported
+
+    return node_is_supported(node_path)
+
+
+def _ensure_node_dependency() -> bool:
+    """Lazy bridge to the shared Node installer."""
+    from hermes_cli.dep_ensure import ensure_dependency
+
+    return ensure_dependency("node")
+
+
+def _node_bin(command: str = "node", *, fatal: bool = False) -> str | None:
+    """Resolve a supported Node binary without bypassing the no-bootstrap gate."""
+    path: str | None = None
+    if command == "node":
+        env_node = os.environ.get("HERMES_NODE")
+        if (
+            env_node
+            and os.path.isfile(env_node)
+            and os.access(env_node, os.X_OK)
+            and _node_is_supported(env_node)
+        ):
+            path = env_node
+
+    if path is None:
+        path = shutil.which(command)
+    if command == "node" and path and not _node_is_supported(path):
+        path = None
+
+    skip_bootstrap = bool(os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"))
+    if path is None and command == "node" and not skip_bootstrap:
+        try:
+            if _ensure_node_dependency():
+                path = shutil.which("node")
+                if path and not _node_is_supported(path):
+                    path = None
+        except Exception:
+            path = None
+
+    if path is not None or not fatal:
+        return path
+    if command == "node":
+        print(
+            "Node.js 24+ not found — install a supported Node.js runtime "
+            "to use this feature."
+        )
+    else:
+        print(f"{command} not found — install Node.js 24+ to use this feature.")
+    sys.exit(1)
+
+
+def _supported_npm_bin() -> str | None:
+    """Return npm only when its process has access to a supported Node runtime."""
+    if not _node_is_supported():
+        return None
+    return shutil.which("npm")
+
+
 def _find_bundled_tui(hermes_cli_dir: Path | None = None) -> Path | None:
     """Find a pre-built TUI entry.js bundled in the wheel."""
     if hermes_cli_dir is None:
@@ -1633,24 +1695,6 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
 
-    def _node_bin(bin: str) -> str:
-        if bin == "node":
-            env_node = os.environ.get("HERMES_NODE")
-            if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
-                return env_node
-        path = shutil.which(bin)
-        if not path and bin == "node":
-            try:
-                from hermes_cli.dep_ensure import ensure_dependency
-                if ensure_dependency("node"):
-                    path = shutil.which("node")
-            except Exception:
-                pass
-        if not path:
-            print(f"{bin} not found — install Node.js to use the TUI.")
-            sys.exit(1)
-        return path
-
     # Footgun: --dev against a prebuilt bundle that has no source/node_modules.
     ext_dir = os.environ.get("HERMES_TUI_DIR")
     if tui_dev and ext_dir:
@@ -1662,18 +1706,19 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         )
         sys.exit(1)
 
+    node = _node_bin("node", fatal=True)
+    assert node is not None
+
     # 1. Prebuilt bundle (nix / packaged release): just run it.
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
             if (p / "dist" / "entry.js").is_file():
-                node = _node_bin("node")
                 return [node, "--expose-gc", str(p / "dist" / "entry.js")], p
 
         # 1b. Bundled in wheel (pip install)
         bundled = _find_bundled_tui()
         if bundled is not None:
-            node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
 
     # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
@@ -1791,7 +1836,6 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
 
-    node = _node_bin("node")
     return [node, "--expose-gc", str(tui_dir / "dist" / "entry.js")], tui_dir
 
 
@@ -2456,9 +2500,9 @@ def cmd_whatsapp(args):
         print(
             "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
         )
-        npm = shutil.which("npm")
+        npm = _supported_npm_bin()
         if not npm:
-            print("  ✗ npm not found on PATH — install Node.js first")
+            print("  ✗ Node.js 24+/npm not found on PATH — install Node.js first")
             return
         try:
             result = subprocess.run(
@@ -4739,11 +4783,11 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             encoding = getattr(sys.stdout, "encoding", None) or "ascii"
             print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
-    npm = shutil.which("npm")
+    npm = _supported_npm_bin()
     if not npm:
         if fatal:
-            _say("Web UI frontend not built and npm is not available.")
-            _say("Install Node.js, then run:  cd web && npm install && npm run build")
+            _say("Web UI frontend not built and Node.js 24+/npm is not available.")
+            _say("Install Node.js 24+, then run:  cd web && npm install && npm run build")
         return not fatal
     _say("→ Building web UI...")
 
@@ -5277,10 +5321,13 @@ def cmd_gui(args: argparse.Namespace):
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
     if source_mode or not skip_build:
-        npm = shutil.which("npm")
+        npm = _supported_npm_bin()
         if not npm:
-            print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
-            print("Install Node.js, then run:  hermes gui")
+            print(
+                "Desktop GUI requires Node.js 24+/npm, but npm was not found on PATH "
+                "or the available Node.js runtime is unsupported."
+            )
+            print("Install Node.js 24+, then run:  hermes gui")
             sys.exit(1)
     else:
         npm = None
@@ -7508,7 +7555,7 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
 
 
 def _update_node_dependencies() -> None:
-    npm = shutil.which("npm")
+    npm = _supported_npm_bin()
     if not npm:
         return
 
@@ -8881,7 +8928,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Electron build by ``hermes update``.
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
         has_desktop_app = _desktop_packaged_executable(desktop_dir) is not None or _desktop_dist_exists(desktop_dir)
-        if (desktop_dir / "package.json").exists() and shutil.which("npm") and has_desktop_app:
+        if (desktop_dir / "package.json").exists() and has_desktop_app and _supported_npm_bin():
             print("→ Checking if desktop app needs rebuilding...")
             _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
             # Stream the build output live (long Electron builds otherwise

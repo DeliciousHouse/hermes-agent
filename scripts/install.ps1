@@ -95,7 +95,7 @@ try {
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
 $PythonVersion = "3.11"
-$NodeVersion = "22"
+$NodeVersion = "24"
 
 # Stage-protocol version.  Bumped only for genuinely breaking changes to the
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
@@ -744,11 +744,10 @@ function Set-GitBashEnvVar {
     Write-Info "If needed, set HERMES_GIT_BASH_PATH manually to your bash.exe path."
 }
 
-# The desktop build runs Vite ^8, which refuses to start on Node outside
-# `^20.19 || >=22.12` -- older Node lacks node:util.styleText, so `vite build`
-# crashes with a SyntaxError that surfaces only as the opaque "Build desktop
-# app ... exit code 1" install failure. Returns $true when a `node --version`
-# string clears that floor.
+# The root workspace declares Node >=$NodeVersion. Keep the installer on that
+# same baseline so every npm path (browser tools, TUI, and desktop builds) runs
+# with a supported runtime instead of merely clearing an individual package's
+# lower compatibility floor.
 function Test-NodeVersionOk {
     param([string]$Version)
     try {
@@ -756,8 +755,7 @@ function Test-NodeVersionOk {
     } catch {
         return $false
     }
-    if ($v.Major -eq 20 -and $v.Minor -ge 19) { return $true }
-    if ($v.Major -ge 22 -and ($v.Major -gt 22 -or $v.Minor -ge 12)) { return $true }
+    if ($v.Major -ge [int]$NodeVersion) { return $true }
     return $false
 }
 
@@ -771,7 +769,7 @@ function Test-Node {
             $script:HasNode = $true
             return $true
         }
-        Write-Warn "Node.js $version is too old for the desktop build (need ^20.19 or >=22.12)"
+        Write-Warn "Node.js $version is below the repository baseline (need >=$NodeVersion)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
@@ -831,6 +829,12 @@ function Test-Node {
                 }
 
                 $version = & "$HermesHome\node\node.exe" --version
+                if (-not (Test-NodeVersionOk $version)) {
+                    Write-Warn "Hermes-managed Node.js $version is below the required >=$NodeVersion baseline"
+                    Write-Info "Install Node.js $NodeVersion+ manually: https://nodejs.org/en/download/"
+                    $script:HasNode = $false
+                    return $false
+                }
                 Write-Success "Node.js $version installed to $HermesHome\node\ (portable, user-scoped)"
                 $script:HasNode = $true
 
@@ -875,7 +879,7 @@ function Test-Node {
             $ErrorActionPreference = $prevEAP
             # Refresh PATH
             $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
-            if (Get-Command node -ErrorAction SilentlyContinue) {
+            if ((Get-Command node -ErrorAction SilentlyContinue) -and (Test-NodeVersionOk (node --version))) {
                 $version = node --version
                 Write-Success "Node.js $version installed via winget"
                 $script:HasNode = $true
@@ -889,7 +893,7 @@ function Test-Node {
 
     Write-Info "Install manually: https://nodejs.org/en/download/"
     $script:HasNode = $false
-    return $true
+    return $false
 }
 
 function Update-ProcessPathForPackages {
@@ -1883,9 +1887,9 @@ function Install-NodeDeps {
         # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME
         # in a fresh powershell.exe) means $script:HasNode set by Stage-Node
         # in the previous process isn't visible here. Re-probe rather than
-        # trust the stale global — Stage-Node already ran successfully or
-        # the bootstrap would've aborted, so npm is reachable.
-        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        # trust the stale global. Re-running Test-Node also prevents an old
+        # npm shim on PATH from bypassing the repository's Node baseline.
+        if (-not (Test-Node)) {
             Write-Info "Skipping Node.js dependencies (Node not installed)"
             return
         }
@@ -2172,15 +2176,15 @@ function Install-Desktop {
 
     # Always re-resolve Node here. Stages run in separate PowerShell processes,
     # so $script:HasNode from Stage-Node isn't visible; more importantly Test-Node
-    # enforces the build floor (^20.19 || >=22.12) and prepends the Hermes-managed
-    # Node to PATH, so the build never runs on a too-old system Node -- the cause
+    # enforces the root Node >=$NodeVersion baseline and prepends the managed Node
+    # to PATH, so the build never runs on a too-old system Node -- the cause
     # of the opaque "Build desktop app ... exit code 1" failure (Vite crashes on
     # old Node).
-    Test-Node | Out-Null
+    if (-not (Test-Node)) {
+        throw "Cannot build desktop app: Node.js $NodeVersion+ unavailable after automatic installation. Install it from https://nodejs.org/en/download/ and retry."
+    }
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-        Write-Warn "Skipping desktop build (Node.js / npm not on PATH)"
-        $script:_StageSkippedReason = "Node.js not available"
-        return
+        throw "Cannot build desktop app: npm is unavailable for Node.js $NodeVersion+. Repair the Node.js installation and retry."
     }
 
     $desktopDir = "$InstallDir\apps\desktop"
