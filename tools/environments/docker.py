@@ -1041,6 +1041,13 @@ class DockerEnvironment(BaseEnvironment):
         )
         _enforce_egress = _egress_enforce_on_docker()
         _critical_egress_names = _critical_egress_env_names(egress_env_overrides)
+        # Retain the construction-time egress posture for dynamic per-command
+        # forwarding. Skills may register passthrough names after the container
+        # exists; those late names must pass the same collision policy as
+        # docker_forward_env/docker_env instead of bypassing it on docker exec.
+        self._egress_env_overrides = dict(egress_env_overrides)
+        self._critical_egress_names = set(_critical_egress_names)
+        self._enforce_egress = _enforce_egress
         if egress_env_overrides:
             _forward_collisions = sorted(
                 key for key in self._forward_env if key in _critical_egress_names
@@ -1474,13 +1481,14 @@ class DockerEnvironment(BaseEnvironment):
             passthrough_keys = set(get_all_passthrough())
         except Exception:
             pass
+        implicit_passthrough_keys = passthrough_keys - explicit_forward_keys
         # Explicit docker_forward_env entries are an intentional opt-in and must
         # win over the generic Hermes secret blocklist. Only implicit passthrough
         # keys are filtered. Also strip Hermes-internal dynamic secrets
         # (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth) that the
         # name-based blocklist doesn't cover — see _is_hermes_internal_secret.
         _implicit_forward = {
-            k for k in passthrough_keys if not _is_hermes_internal_secret(k)
+            k for k in implicit_passthrough_keys if not _is_hermes_internal_secret(k)
         }
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
@@ -1491,6 +1499,28 @@ class DockerEnvironment(BaseEnvironment):
                 value = hermes_env.get(key)
             if value:
                 resolved[key] = value
+        if getattr(self, "_egress_env_overrides", None):
+            _passthrough_collisions = sorted(
+                set(resolved)
+                & implicit_passthrough_keys
+                & getattr(self, "_critical_egress_names", set())
+            )
+            if _passthrough_collisions:
+                _enforce_egress = bool(getattr(self, "_enforce_egress", True))
+                _msg = (
+                    "env_passthrough would inject real egress-protected "
+                    f"variables {_passthrough_collisions}; enforce_on_docker is "
+                    f"{'enabled' if _enforce_egress else 'disabled'}."
+                )
+                if _enforce_egress:
+                    raise RuntimeError(
+                        f"{_msg}  Remove these late passthrough names or disable "
+                        "enforce_on_docker to opt out of egress isolation."
+                    )
+                logger.warning(
+                    "%s  Late env_passthrough values will override egress controls.",
+                    _msg,
+                )
         return resolved
 
     @staticmethod
@@ -1525,7 +1555,11 @@ class DockerEnvironment(BaseEnvironment):
         # explicitly allowlisted forwarding values; this keeps credentials
         # available without ever making the snapshot their storage channel.
         if login:
-            cmd.extend(self._init_env_args)
+            # Snapshot failure falls back to a login shell per command. Resolve
+            # the allowlists again here: a skill may have registered a required
+            # credential after the failed bootstrap, so the cached init argv is
+            # stale and would silently drop it from every fallback command.
+            cmd.extend(self._build_init_env_args())
         else:
             # Resolve at execution time because a skill can register required
             # environment variables after the Docker session was bootstrapped.

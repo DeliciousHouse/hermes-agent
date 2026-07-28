@@ -345,6 +345,22 @@ class SSHEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
         cmd = self._build_ssh_command()
+        transient_env = self._command_transient_env()
+        if transient_env:
+            transient_var = f"__hermes_transient_{self._session_id}"
+            read_record = (
+                f"IFS= builtin read -r -d '' {transient_var} || exit 125; "
+                f"builtin export -- \"${transient_var}\" || exit 125; "
+            )
+            cmd_string = (
+                (read_record * len(transient_env))
+                + f"builtin unset {transient_var}; "
+                + cmd_string
+            )
+            stdin_data = "".join(
+                f"{name}={value}\0"
+                for name, value in sorted(transient_env.items())
+            ) + (stdin_data or "")
         if login:
             cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
         else:

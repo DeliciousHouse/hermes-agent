@@ -2466,12 +2466,17 @@ def terminal_tool(
             )
             try:
                 if env_type == "local":
+                    background_env = getattr(env, "background_env", None)
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
-                        env_vars=env.env if hasattr(env, 'env') else None,
+                        env_vars=(
+                            background_env()
+                            if callable(background_env)
+                            else (env.env if hasattr(env, "env") else None)
+                        ),
                         use_pty=effective_pty,
                     )
                 else:

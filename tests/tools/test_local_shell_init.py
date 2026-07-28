@@ -7,6 +7,7 @@ tests verify the config-driven prelude that fixes that.
 """
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -255,6 +256,99 @@ class TestSnapshotEndToEnd:
         output = result.get("output", "")
         assert "PROBE=probe-ok" in output
         assert "/opt/shell-init-probe/bin" in output
+
+    def test_sensitive_init_export_is_transiently_available_not_snapshotted(
+        self,
+        tmp_path,
+    ):
+        """Init-only credentials reach commands without becoming snapshot state."""
+        init_file = tmp_path / "credentials-init.sh"
+        name = "SHELL_INIT_DEMO_API_TOKEN"
+        value = "transient-command-value"
+        init_file.write_text(f"echo INIT-NOISE\nexport {name}={value}\n")
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                bootstrap_snapshot = Path(env._snapshot_path).read_text()
+                result = env.execute(f'printf "%s" "${name}"')
+                command_snapshot = Path(env._snapshot_path).read_text()
+            finally:
+                env.cleanup()
+
+        assert result["returncode"] == 0, result.get("output", "")
+        assert result.get("output", "") == value
+        assert "INIT-NOISE" not in result.get("output", "")
+        for snapshot in (bootstrap_snapshot, command_snapshot):
+            assert name not in snapshot
+            assert value not in snapshot
+
+    def test_protected_provider_init_export_stays_unavailable(self, tmp_path):
+        """Transient replay must not bypass terminal credential filtering."""
+        init_file = tmp_path / "provider-credentials-init.sh"
+        name = "OPENAI_API_KEY"
+        value = "synthetic-provider-value"
+        init_file.write_text(f"export {name}={value}\n")
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute(f'printf "%s" "${{{name}:-missing}}"')
+                snapshot = Path(env._snapshot_path).read_text()
+            finally:
+                env.cleanup()
+
+        assert result["returncode"] == 0, result.get("output", "")
+        assert result.get("output", "") == "missing"
+        assert name not in snapshot
+        assert value not in snapshot
+
+    def test_init_export_cannot_capture_conversation_session_metadata(
+        self, tmp_path,
+    ):
+        """Shared Local environments cannot retain a creator session derivative."""
+        init_file = tmp_path / "session-derived-init.sh"
+        name = "DERIVED_API_TOKEN"
+        init_file.write_text(f'export {name}="$HERMES_SESSION_ID"\n')
+        bootstrap_env = dict(os.environ)
+        bootstrap_env["HERMES_SESSION_ID"] = "session-a"
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ), patch(
+            "tools.environments.local._make_run_env",
+            return_value=bootstrap_env,
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                snapshot = Path(env._snapshot_path).read_text()
+            finally:
+                env.cleanup()
+
+        assert env._transient_env.get(name) != "session-a"
+        assert "session-a" not in snapshot
+
+    def test_background_env_includes_only_sanitized_transient_exports(self):
+        """Local background and PTY spawns receive the same safe transient map."""
+        env = LocalEnvironment.__new__(LocalEnvironment)
+        env.env = {"STATIC_SETTING": "static"}
+        env._transient_env = {
+            "SHELL_INIT_DEMO_API_TOKEN": "third-party-value",
+            "OPENAI_API_KEY": "protected-provider-value",
+        }
+
+        result = env.background_env()
+
+        assert result["STATIC_SETTING"] == "static"
+        assert result["SHELL_INIT_DEMO_API_TOKEN"] == "third-party-value"
+        assert "OPENAI_API_KEY" not in result
 
     def test_profile_path_export_survives_bashrc_interactive_guard(
         self, tmp_path, monkeypatch

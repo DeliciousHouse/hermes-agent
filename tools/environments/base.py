@@ -425,21 +425,29 @@ def _case_insensitive_shell_glob(value: str) -> str:
     )
 
 
-def _export_dump_excluding_session_vars(tmp_path: str) -> str:
+def _export_dump_excluding_session_vars(
+    tmp_path: str,
+    *,
+    bash_path: str = '"$BASH"',
+    transient_marker: str | None = None,
+) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
     per-session bridged vars and sensitive names.
 
-    Unset names in a subshell *before* ``export -p``. Sensitive names match
-    ``_SNAPSHOT_SENSITIVE_ENV_NAME_REGEX``; ``compgen -e`` enumerates exported
-    names without reading their values. A line-based ``grep -vE`` filter is
+    Unset names in a clean privileged child Bash *before* ``export -p``.
+    Sensitive names match ``_SNAPSHOT_SENSITIVE_ENV_NAME_REGEX``; trusted
+    ``builtin compgen -e`` enumerates exported names without reading their
+    values. A line-based ``grep -vE`` filter is
     unsafe: bash 3.2 prints a value containing a newline as a multi-line
     ``declare -x NAME="…`` block, so only the opener matches the regex and
     continuation lines (e.g. ``curl … | bash #`` smuggled into a Matrix
     room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the snapshot and
     execute on the next ``source`` (issue #71296). Removing the export bit and
     unsetting first means ``export -p`` never emits those vars — including
-    readonly vars that cannot be unset, or any continuation lines. ``|| true``
-    keeps the success contract for callers that chain on it.
+    readonly vars that cannot be unset in the caller, or any continuation
+    lines. The fresh child deliberately discards caller functions, ``BASH_ENV``,
+    and readonly attributes; otherwise a command could shadow ``compgen`` or
+    reserve the scrub loop's variable before the post-command dump.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
     the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
@@ -451,25 +459,48 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     """
     # ${!PREFIX*}, compgen, and process substitution are available in bash 3.2.
     # ``IFS= read -r`` consumes compgen's newline-delimited names without using
-    # the caller's current IFS. Empty matches are fine because the loop simply
-    # does not run.
+    # the caller's current IFS. A sentinel proves enumeration completed: a
+    # missing/failed enumeration makes the dump fail so callers keep the last
+    # known-good snapshot instead of publishing an unsanitized or empty file.
     sensitive_name_patterns = "|".join(
         f"*{_case_insensitive_shell_glob(part)}*"
         for part in _SNAPSHOT_SENSITIVE_ENV_NAME_PARTS
     )
-    return (
-        "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+    transient_start = ""
+    transient_value = ""
+    transient_end = ""
+    if transient_marker:
+        transient_start = (
+            f"builtin printf '\\0={transient_marker}_START\\0' >&2; "
+        )
+        transient_value = (
+            "builtin printf '%s=%s\\0' \"$__hermes_env_name\" "
+            "\"${!__hermes_env_name}\" >&2; "
+        )
+        transient_end = f"builtin printf '={transient_marker}_END\\0' >&2; "
+    scrub_script = (
+        "export __HERMES_ENV_ENUM_SENTINEL=1; "
+        "__hermes_env_seen=; "
+        f"{transient_start}"
+        "builtin unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "HERMES_UI_SESSION_ID 2>/dev/null || exit 1; "
         "while IFS= read -r __hermes_env_name; do "
         "case \"$__hermes_env_name\" in "
+        "__HERMES_ENV_ENUM_SENTINEL) __hermes_env_seen=1 ;; "
         f"{sensitive_name_patterns}) "
-        "export -n \"$__hermes_env_name\" 2>/dev/null || true; "
-        "unset \"$__hermes_env_name\" 2>/dev/null || true ;; "
-        "esac; done < <(compgen -e); unset __hermes_env_name; "
-        "export -p; "
-        ") || true; } "
-        f"> {tmp_path}"
+        f"{transient_value}"
+        "builtin unset -- \"$__hermes_env_name\" 2>/dev/null || exit 1 ;; "
+        "esac; "
+        "done < <(builtin compgen -e); "
+        "[ \"$__hermes_env_seen\" = 1 ] || exit 1; "
+        f"{transient_end}"
+        "builtin unset __HERMES_ENV_ENUM_SENTINEL __hermes_env_seen "
+        "__hermes_env_name || exit 1; "
+        "builtin export -p"
+    )
+    return (
+        f"{{ {bash_path} --noprofile --norc -p -c "
+        f"{shlex.quote(scrub_script)}; }} > {tmp_path}"
     )
 
 
@@ -511,6 +542,8 @@ class BaseEnvironment(ABC):
         self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
+        self._transient_env_marker = f"HERMES_TRANSIENT_{self._session_id}"
+        self._transient_env: dict[str, str] = {}
         self._snapshot_ready = False
         # When True, login bash is unusable (e.g. broken Git-for-Windows
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
@@ -589,7 +622,8 @@ class BaseEnvironment(ABC):
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
         bootstrap = (
             f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp, transient_marker=self._transient_env_marker)} || "
+            f"{{ rm -f {_snap_tmp}; exit 1; }}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -618,6 +652,7 @@ class BaseEnvironment(ABC):
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
+            self._extract_transient_env(result)
             if int(result.get("returncode") or 0) != 0:
                 raise RuntimeError(
                     f"snapshot bootstrap failed with exit code {result.get('returncode')}"
@@ -662,6 +697,59 @@ class BaseEnvironment(ABC):
                     detail,
                 )
 
+    def _extract_transient_env(self, result: dict) -> None:
+        """Capture scrubbed login-only credentials in process memory.
+
+        The privileged snapshot scrubber emits NUL-delimited records on its
+        stderr side channel before unsetting sensitive names.  Keeping those
+        values in memory lets Local and SSH pass them to each fresh command
+        without writing them to the plaintext snapshot or replaying profile
+        scripts and their output/side effects.
+        """
+        output = result.get("output", "")
+        marker = self._transient_env_marker
+        start_record = f"\0={marker}_START\0"
+        end_record = f"={marker}_END\0"
+        start = output.rfind(start_record)
+        if start == -1:
+            return
+        payload_start = start + len(start_record)
+        end = output.find(end_record, payload_start)
+        if end == -1:
+            return
+
+        captured: dict[str, str] = {}
+        for record in output[payload_start:end].split("\0"):
+            name, separator, value = record.partition("=")
+            if not separator or not name:
+                continue
+            if not (name[0].isalpha() or name[0] == "_"):
+                continue
+            if not all(char.isalnum() or char == "_" for char in name):
+                continue
+            if not any(part in name.upper() for part in _SNAPSHOT_SENSITIVE_ENV_NAME_PARTS):
+                continue
+            captured[name] = value
+
+        self._transient_env = captured
+        result["output"] = output[:start] + output[end + len(end_record) :]
+
+    def _command_transient_env(self) -> dict[str, str]:
+        """Return captured init exports allowed across the terminal boundary."""
+        if not self._transient_env:
+            return {}
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+
+            sanitized = _sanitize_subprocess_env({}, self._transient_env)
+        except Exception:
+            return {}
+        return {
+            name: sanitized[name]
+            for name in self._transient_env
+            if name in sanitized
+        }
+
     # ------------------------------------------------------------------
     # Command wrapping
     # ------------------------------------------------------------------
@@ -703,7 +791,9 @@ class BaseEnvironment(ABC):
         # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
 
-        parts = []
+        bash_path_var = f"__hermes_bash_path_{self._session_id}"
+        bash_path_expr = f'"${{{bash_path_var}}}"'
+        parts = [f"readonly {bash_path_var}=\"$BASH\""]
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
@@ -740,7 +830,7 @@ class BaseEnvironment(ABC):
         # _export_dump_excluding_session_vars.
         if self._snapshot_ready:
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, bash_path=bash_path_expr)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )

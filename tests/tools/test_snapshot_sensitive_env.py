@@ -17,6 +17,7 @@ from tools.environments.base import (
     _SNAPSHOT_SENSITIVE_ENV_NAME_REGEX,
     _export_dump_excluding_session_vars,
 )
+from tools.environments.local import LocalEnvironment
 
 
 def test_sensitive_name_regex_contract():
@@ -160,3 +161,66 @@ def test_post_command_snapshot_redacts_sensitive_env_with_altered_ifs(
     follow_up = env.execute(f'printf "%s" "${{{name}:-missing}}"')
     assert follow_up["returncode"] == 0, follow_up["output"]
     assert follow_up["output"] == "missing"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="POSIX bash snapshot path required",
+)
+@pytest.mark.parametrize(
+    "caller_state",
+    (
+        "compgen() { return 0; }",
+        "readonly __hermes_env_name",
+    ),
+    ids=("shadowed-compgen", "readonly-scratch-name"),
+)
+def test_local_execute_snapshot_scrub_ignores_caller_shell_state(
+    tmp_path: Path,
+    caller_state: str,
+):
+    """A command cannot disable redaction by shadowing scrub internals."""
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        assert env._snapshot_ready
+        name = "DEMO_API_TOKEN"
+        value = "must-remain-transient"
+
+        result = env.execute(
+            f"export {name}={shlex.quote(value)}; {caller_state}"
+        )
+
+        assert result["returncode"] == 0, result["output"]
+        snapshot = Path(env._snapshot_path).read_text()
+        assert name not in snapshot
+        assert value not in snapshot
+
+        follow_up = env.execute(f'printf "%s" "${{{name}:-missing}}"')
+        assert follow_up["returncode"] == 0, follow_up["output"]
+        assert follow_up["output"] == "missing"
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="POSIX bash snapshot path required",
+)
+def test_export_dump_reuses_running_bash_when_path_has_no_default_bash(tmp_path: Path):
+    """Nix/custom Bash paths must not make snapshot persistence fail closed."""
+    custom_bash = tmp_path / "custom-bin" / "bash"
+    custom_bash.parent.mkdir()
+    custom_bash.symlink_to(shutil.which("bash"))
+    snapshot_path = tmp_path / "snapshot.sh"
+    dump = _export_dump_excluding_session_vars(shlex.quote(str(snapshot_path)))
+
+    proc = subprocess.run(
+        [str(custom_bash), "-c", f"PATH=/no-default-utilities; {dump}"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": str(custom_bash.parent)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert snapshot_path.exists()
+    assert "declare -x PATH=" in snapshot_path.read_text()

@@ -70,7 +70,9 @@ def test_export_snippet_shape():
     # that expands the follow-up ``mv`` operand), silently orphaning the dump
     # and breaking snapshot env persistence entirely.
     assert snippet.lstrip().startswith("{ ")
-    assert "|| true; }" in snippet
+    assert "--noprofile --norc -p" in snippet
+    assert "builtin compgen -e" in snippet
+    assert "|| true; }" not in snippet
     assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
 
 

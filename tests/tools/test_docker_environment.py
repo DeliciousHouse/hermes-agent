@@ -282,8 +282,12 @@ def _make_execute_only_env(forward_env=None):
     env._cwd_file = "/tmp/hermes-cwd-test123.txt"
     env._cwd_marker = "__HERMES_CWD_test123__"
     env._snapshot_ready = True
+    env._prefer_nonlogin = False
     env._last_sync_time = None
     env._init_env_args = []
+    env._egress_env_overrides = {}
+    env._critical_egress_names = set()
+    env._enforce_egress = True
     return env
 
 
@@ -373,6 +377,114 @@ def test_command_env_args_include_only_allowlisted_forwarding(monkeypatch):
     ]
     assert "UNLISTED_TOKEN" not in " ".join(args)
     assert "STATIC_TOKEN" not in " ".join(args)
+
+
+@pytest.mark.parametrize("name", ("HTTPS_PROXY", "NO_PROXY"))
+def test_late_implicit_egress_passthrough_is_rejected_when_enforced(
+    monkeypatch,
+    name,
+):
+    """Late skill registration cannot override enforced egress controls."""
+    from tools import env_passthrough
+
+    passthrough: set[str] = set()
+    env = _make_execute_only_env()
+    env._egress_env_overrides = {name: "http://hermes-egress.invalid"}
+    env._critical_egress_names = {name}
+    env._enforce_egress = True
+    monkeypatch.setenv(name, "http://caller-controlled.invalid")
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: passthrough)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    assert env._build_command_env_args() == []
+    passthrough.add(name)
+
+    with pytest.raises(RuntimeError, match=f"env_passthrough.*{name}"):
+        env._build_command_env_args()
+
+
+@pytest.mark.parametrize("name", ("HTTPS_PROXY", "NO_PROXY"))
+def test_late_implicit_egress_passthrough_warns_and_forwards_in_opt_out(
+    monkeypatch,
+    caplog,
+    name,
+):
+    """The documented enforce_on_docker=false opt-out remains available."""
+    from tools import env_passthrough
+
+    passthrough: set[str] = set()
+    env = _make_execute_only_env()
+    env._egress_env_overrides = {name: "http://hermes-egress.invalid"}
+    env._critical_egress_names = {name}
+    env._enforce_egress = False
+    value = "http://caller-controlled.invalid"
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: passthrough)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    assert env._build_command_env_args() == []
+    passthrough.add(name)
+
+    with caplog.at_level(logging.WARNING):
+        args = env._build_command_env_args()
+
+    assert args == ["-e", f"{name}={value}"]
+    assert any(
+        "env_passthrough" in record.getMessage()
+        and name in record.getMessage()
+        and "disabled" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_late_implicit_egress_passthrough_without_value_is_ignored(monkeypatch):
+    """A stale allowlist name cannot override egress and must not block commands."""
+    from tools import env_passthrough
+
+    passthrough: set[str] = set()
+    env = _make_execute_only_env()
+    env._egress_env_overrides = {"HTTPS_PROXY": "http://hermes-egress.invalid"}
+    env._critical_egress_names = {"HTTPS_PROXY"}
+    env._enforce_egress = True
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: passthrough)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    passthrough.add("HTTPS_PROXY")
+
+    assert env._build_command_env_args() == []
+
+
+def test_failed_bootstrap_login_fallback_resolves_late_allowlist(
+    monkeypatch,
+):
+    """A login fallback must not reuse the bootstrap's stale env arguments."""
+    from tools import env_passthrough
+
+    passthrough: set[str] = set()
+    env = _make_execute_only_env()
+    env._snapshot_ready = False
+    env._init_env_args = []
+    name = "LATE_SKILL_API_TOKEN"
+    value = "registered-after-failed-bootstrap"
+    captured: dict[str, list[str]] = {}
+
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: passthrough)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    def _capture(cmd, stdin_data=None):
+        captured["cmd"] = list(cmd)
+        return _FakePopen(cmd)
+
+    monkeypatch.setattr(docker_env, "_popen_bash", _capture)
+    passthrough.add(name)
+
+    result = env.execute("true")
+
+    assert result["returncode"] == 0
+    assert captured["cmd"][-4:-1] == ["bash", "-l", "-c"]
+    assert f"{name}={value}" in captured["cmd"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")

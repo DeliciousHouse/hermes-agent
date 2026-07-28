@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 from unittest.mock import MagicMock
 
@@ -9,6 +10,9 @@ import pytest
 
 from tools.environments.ssh import SSHEnvironment
 from tools.environments import ssh as ssh_env
+from tools.environments.local import _find_bash
+
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 _SSH_HOST = os.getenv("TERMINAL_SSH_HOST", "")
 _SSH_USER = os.getenv("TERMINAL_SSH_USER", "")
@@ -65,6 +69,46 @@ class TestBuildSSHCommand:
     def test_user_host_suffix(self):
         env = SSHEnvironment(host="h", user="u")
         assert env._build_ssh_command()[-1] == "u@h"
+
+    def test_snapshot_commands_inject_transient_env_without_login_replay(self, monkeypatch):
+        """Remote init-only credentials remain transient without profile replay."""
+        env = SSHEnvironment(host="h", user="u")
+        env._snapshot_ready = True
+        env._transient_env = {"SHELL_INIT_DEMO_API_TOKEN": "transient-value"}
+        env._build_ssh_command = lambda: ["ssh", "u@h"]
+        captured = {}
+
+        def _capture(cmd, stdin_data=None):
+            captured["cmd"] = list(cmd)
+            captured["stdin_data"] = stdin_data
+            return MagicMock()
+
+        monkeypatch.setattr(ssh_env, "_popen_bash", _capture)
+
+        env._run_bash(
+            'printf "%s|" "$SHELL_INIT_DEMO_API_TOKEN"; cat',
+            login=False,
+            stdin_data="command-input",
+        )
+
+        argv = " ".join(captured["cmd"])
+        assert "transient-value" not in argv
+        assert captured["cmd"][-3:-1] == ["bash", "-c"]
+        assert "-l" not in captured["cmd"]
+        assert captured["stdin_data"] == (
+            "SHELL_INIT_DEMO_API_TOKEN=transient-value\0command-input"
+        )
+        remote_script = shlex.split(captured["cmd"][-1])[0]
+        probe = _REAL_SUBPROCESS_POPEN(
+            [_find_bash(), "-c", remote_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = probe.communicate(captured["stdin_data"])
+        assert probe.returncode == 0, stderr
+        assert stdout == "transient-value|command-input"
 
 
 class TestControlSocketPath:

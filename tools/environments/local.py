@@ -1296,7 +1296,22 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
+        self._shell_init_files = _resolve_shell_init_files()
         self.init_session()
+
+    def init_session(self) -> None:
+        """Bootstrap without exposing conversation-scoped metadata to init files."""
+        self._initializing_snapshot = True
+        try:
+            super().init_session()
+        finally:
+            self._initializing_snapshot = False
+
+    def background_env(self) -> dict[str, str]:
+        """Return sanitized overrides shared by local background/PTY commands."""
+        overrides = dict(self.env)
+        overrides.update(self._command_transient_env())
+        return overrides
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
@@ -1359,18 +1374,25 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
-        # For login-shell invocations (used by init_session to build the
-        # environment snapshot), prepend sources for the user's bashrc /
-        # custom init files so tools registered outside bash_profile
-        # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
-        # Non-login invocations are already sourcing the snapshot and
-        # don't need this.
-        if login:
+        # Only the login bootstrap sources init files. It captures sensitive
+        # exports into an in-memory map; replaying init on normal commands would
+        # corrupt command output and repeat arbitrary profile side effects.
+        init_files = getattr(self, "_shell_init_files", None)
+        if init_files is None:
             init_files = _resolve_shell_init_files()
-            if init_files:
-                cmd_string = _prepend_shell_init(cmd_string, init_files)
+        if login and init_files:
+            cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        if getattr(self, "_initializing_snapshot", False):
+            for name in tuple(run_env):
+                if (
+                    name.startswith("HERMES_SESSION_")
+                    or name.startswith("HERMES_CRON_AUTO_DELIVER_")
+                    or name == "HERMES_UI_SESSION_ID"
+                ):
+                    run_env.pop(name, None)
+        run_env.update(self._command_transient_env())
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
