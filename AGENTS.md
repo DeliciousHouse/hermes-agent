@@ -453,19 +453,18 @@ Newline-delimited JSON-RPC over stdio. Requests from Ink, events from Python. Se
 
 ### Dev Commands
 
-Install from the repository root, then run TUI scripts from `ui-tui`, where
-they are declared:
+Run these commands from the repository root. TUI scripts are declared in
+`ui-tui/package.json` and selected through npm's workspace flag:
 
 ```bash
 npm run install:tui # first time
-cd ui-tui
-npm run dev         # watch mode (rebuilds hermes-ink + tsx --watch)
-npm start           # production
-npm run build       # bundle TUI entrypoint with esbuild
-npm run typecheck   # typecheck only (tsc --noEmit)
-npm run lint        # eslint
-npm run fmt         # prettier
-npm test            # vitest
+npm run --workspace ui-tui dev       # watch mode (rebuilds hermes-ink + tsx --watch)
+npm start --workspace ui-tui         # production
+npm run --workspace ui-tui build     # bundle TUI entrypoint with esbuild
+npm run --workspace ui-tui typecheck # typecheck only (tsc --noEmit)
+npm run --workspace ui-tui lint      # eslint
+npm run --workspace ui-tui fmt       # prettier
+npm test --workspace ui-tui          # vitest
 ```
 
 ### TUI in the Dashboard (`hermes dashboard` → `/chat`)
