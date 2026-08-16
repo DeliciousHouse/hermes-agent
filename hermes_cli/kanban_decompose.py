@@ -49,6 +49,45 @@ from hermes_cli import profiles as profiles_mod
 logger = logging.getLogger(__name__)
 
 
+def _unresolved_needs_input_escalation_ids(conn, task_ids) -> set[str]:
+    """Return triage candidates waiting on a typed owner-input escalation."""
+    ids = list(task_ids)
+    if not ids:
+        return set()
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT event.task_id, event.payload
+          FROM task_events event
+          JOIN (
+                SELECT task_id, MAX(id) AS event_id
+                  FROM task_events
+                 WHERE kind = 'block_loop_detected'
+                   AND task_id IN ({placeholders})
+                 GROUP BY task_id
+               ) latest
+            ON latest.event_id = event.id
+         WHERE NOT EXISTS (
+                SELECT 1
+                  FROM task_events resolved
+                 WHERE resolved.task_id = event.task_id
+                   AND resolved.id > event.id
+                   AND resolved.kind = 'blocked'
+               )
+        """,
+        ids,
+    ).fetchall()
+    escalated = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("kind") == "needs_input":
+            escalated.add(row["task_id"])
+    return escalated
+
+
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
 A user dropped a rough idea into the Triage column. Your job is to break it
@@ -283,12 +322,19 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
-        return DecomposeOutcome(
-            task_id, False, f"task is not in triage (status={task.status!r})"
-        )
+        if task is None:
+            return DecomposeOutcome(task_id, False, "unknown task id")
+        if task.status != "triage":
+            return DecomposeOutcome(
+                task_id, False, f"task is not in triage (status={task.status!r})"
+            )
+        if task_id in _unresolved_needs_input_escalation_ids(conn, [task_id]):
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "unresolved needs_input block-loop escalation; "
+                "waiting for an owner decision",
+            )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -466,7 +512,7 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return auto-decomposable task ids currently in the triage column."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -474,4 +520,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        excluded = _unresolved_needs_input_escalation_ids(
+            conn, (row.id for row in rows)
+        )
+    return [row.id for row in rows if row.id not in excluded]

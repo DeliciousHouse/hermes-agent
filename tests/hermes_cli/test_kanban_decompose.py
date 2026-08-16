@@ -55,6 +55,15 @@ def _patch_extra_body():
     )
 
 
+def _append_block_loop_event(conn, task_id, kind):
+    kb._append_event(
+        conn,
+        task_id,
+        "block_loop_detected",
+        {"kind": kind, "reason": "waiting for an owner decision"},
+    )
+
+
 def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
@@ -248,6 +257,52 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.assignee == "fallback"
+
+
+def test_needs_input_block_loop_is_excluded_from_auto_decompose(kanban_home):
+    with kb.connect_closing() as conn:
+        ordinary = kb.create_task(conn, title="ordinary triage", triage=True)
+        needs_input = kb.create_task(conn, title="owner input", triage=True)
+        capability = kb.create_task(conn, title="missing capability", triage=True)
+        untyped = kb.create_task(conn, title="legacy block loop", triage=True)
+        resolved = kb.create_task(conn, title="recovered input", triage=True)
+        manual_marker = kb.create_task(conn, title="manual decomposition", triage=True)
+
+        _append_block_loop_event(conn, needs_input, "needs_input")
+        _append_block_loop_event(conn, capability, "capability")
+        _append_block_loop_event(conn, untyped, None)
+        _append_block_loop_event(conn, resolved, "needs_input")
+        kb._append_event(conn, resolved, "blocked", {"kind": "needs_input"})
+        _append_block_loop_event(conn, manual_marker, "needs_input")
+        kb._append_event(conn, manual_marker, "triage_escalation_recovered", None)
+
+    triage_ids = decomp.list_triage_ids()
+
+    assert needs_input not in triage_ids
+    assert ordinary in triage_ids
+    assert capability in triage_ids
+    assert untyped in triage_ids
+    assert resolved in triage_ids
+    assert manual_marker not in triage_ids
+
+
+def test_decompose_refuses_unresolved_needs_input_block_loop(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="owner input", triage=True)
+        _append_block_loop_event(conn, task_id, "needs_input")
+
+    with patch("agent.auxiliary_client.get_text_auxiliary_client") as call_llm:
+        outcome = decomp.decompose_task(task_id, author="operator")
+
+    assert outcome.ok is False
+    assert "needs_input" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "triage"
+        assert task.title == "owner input"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
 
 
 def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
